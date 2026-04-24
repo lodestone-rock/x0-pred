@@ -584,7 +584,7 @@ class Flow(nn.Module):
         for i in tqdm(range(effective_steps), desc="Euler CFG Sampling"):
             with torch.no_grad():
                 t_val = 1.0 - (i / num_steps)
-                t = torch.ones(x.shape[0], 1).to(self.device, x.dtype) * t_val
+                t = torch.ones(x.shape[0], 1).to(x.device, x.dtype) * t_val
 
                 x0_pos = self.forward(x, t, pos_cond, text_tokens=text_tokens)
                 x0_neg = self.forward(x, t, neg_cond, text_tokens=text_tokens)
