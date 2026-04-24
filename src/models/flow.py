@@ -9,6 +9,15 @@ transformer, including:
   - Flow (top-level model with CFG sampling)
   - Image patch helpers (flatten / unflatten)
   - Timestep distribution helpers
+
+TREAD token routing (arxiv 2501.04765):
+  Training-only speedup: a random subset of image tokens bypasses a span of
+  middle layers (identity transport), then rejoins the full sequence at the
+  end layer.  Inference always uses the standard full forward pass.
+
+  Configure via Flow(..., tread_route=[start, end, rate]) e.g. [2, 8, 0.5].
+  Disable by passing tread_route=None (default) or switching to eval mode.
+  Recommended absolute config for N layers: start=2, end=N-4, rate=0.5.
 """
 
 from __future__ import annotations
@@ -296,6 +305,7 @@ class TransformerNetwork(nn.Module):
         input_proj=True,
         pinch_dim: int = -1,
         compile_blocks: bool = False,
+        tread_route: tuple | None = None,
     ):
         super().__init__()
         if input_proj:
@@ -319,10 +329,94 @@ class TransformerNetwork(nn.Module):
         else:
             self.output_layer = nn.Identity()
 
-    def forward(self, x, attention_mask=None, act_ckpt=False, position_ids=None):
+        # TREAD routing config — stored as plain tuple or None
+        self.tread_route: tuple[int, int, float] | None = None
+        if tread_route is not None:
+            r_start, r_end, r_rate = int(tread_route[0]), int(tread_route[1]), float(tread_route[2])
+            assert 0 < r_start < r_end <= num_layers, (
+                f"tread_route start/end ({r_start}, {r_end}) must satisfy "
+                f"0 < start < end <= num_layers ({num_layers})"
+            )
+            assert 0.0 < r_rate < 1.0, (
+                f"tread_route selection_rate must be in (0, 1), got {r_rate}"
+            )
+            self.tread_route = (r_start, r_end, r_rate)
+
+    def forward(
+        self,
+        x,
+        attention_mask=None,
+        act_ckpt=False,
+        position_ids=None,
+        n_prefix: int = 0,
+    ):
+        """Forward pass with optional TREAD token routing.
+
+        Args:
+            n_prefix: number of non-image prefix tokens at the start of the
+                sequence (text + time + class + register).  Used by TREAD to
+                exclude prefix tokens from routing.  Safe to leave as 0 when
+                tread_route is None or model is in eval mode.
+        """
         x = self.input_layer(x)
-        for block in self.blocks:
+
+        # ----------------------------------------------------------------
+        # TREAD routing setup (training only)
+        # ----------------------------------------------------------------
+        use_tread = self.training and self.tread_route is not None
+        if use_tread:
+            r_start, r_end, r_rate = self.tread_route  # type: ignore[misc]
+            n_img    = x.shape[1] - n_prefix
+            n_routed = int(n_img * r_rate)   # deterministic count → static shape per resolution
+
+            # Random permutation of image-token indices.
+            # First n_routed will bypass layers [r_start, r_end).
+            perm       = torch.randperm(n_img, device=x.device)
+            routed_idx = perm[:n_routed]          # relative to image-token block
+            kept_idx   = perm[n_routed:]
+
+            # Absolute positions in the full sequence
+            routed_abs = routed_idx + n_prefix
+            kept_abs   = kept_idx   + n_prefix
+            prefix_abs = torch.arange(n_prefix, device=x.device)
+
+            # Reduced sequence index: prefix + kept image tokens
+            # Shape is constant for a given (n_img, r_rate) → compile-safe
+            reduced_abs = torch.cat([prefix_abs, kept_abs], dim=0)
+
+            # Slice position_ids to match reduced sequence
+            orig_position_ids = position_ids
+            if position_ids is not None:
+                reduced_pos_ids = position_ids[:, :, reduced_abs]  # [3, B, n_reduced]
+            else:
+                reduced_pos_ids = None
+
+            routed_tokens: torch.Tensor | None = None  # filled at r_start
+        # ----------------------------------------------------------------
+
+        for layer_idx, block in enumerate(self.blocks):
+
+            if use_tread and layer_idx == r_start:
+                # Stash routed tokens, then shrink sequence to prefix + kept
+                routed_tokens = x[:, routed_abs, :]   # [B, n_routed, dim]
+                x             = x[:, reduced_abs, :]
+                position_ids  = reduced_pos_ids
+
+            if use_tread and layer_idx == r_end:
+                # Reinsert routed tokens at their original positions before
+                # this layer so the full sequence is restored.
+                full = torch.empty(
+                    x.shape[0], n_prefix + n_img, x.shape[2],
+                    dtype=x.dtype, device=x.device,
+                )
+                full[:, :n_prefix, :]  = x[:, :n_prefix, :]   # prefix unchanged
+                full[:, kept_abs, :]   = x[:, n_prefix:, :]   # kept image tokens
+                full[:, routed_abs, :] = routed_tokens         # type: ignore[index]
+                x            = full
+                position_ids = orig_position_ids               # restore full pos ids
+
             x = block(x, attention_mask, position_ids=position_ids)
+
         x = self.out_norm(x)
         x = self.output_layer(x)
         return x
@@ -350,6 +444,8 @@ class Flow(nn.Module):
         pos_jitter_range: int = 0,
         compile_blocks: bool = False,
         patch_size: int = 16,
+        # --- TREAD token routing (arxiv 2501.04765) ---
+        tread_route: list | None = None,
     ):
         super().__init__()
         self.dim = dim
@@ -388,6 +484,7 @@ class Flow(nn.Module):
             input_proj=False,
             pinch_dim=-1,
             compile_blocks=compile_blocks,
+            tread_route=tread_route,
         )
         self._init_weights()
 
@@ -456,7 +553,12 @@ class Flow(nn.Module):
             pos_jitter=jitter,
         )
 
-        output_tokens = self.transformer(tokens, attention_mask, position_ids=position_ids)
+        output_tokens = self.transformer(
+            tokens,
+            attention_mask,
+            position_ids=position_ids,
+            n_prefix=n_prefix,
+        )
         pred_patches = output_tokens[:, n_prefix:, ...]
         return image_unflatten(pred_patches, (B, C, H, W), shuffle_size=self._patch_size)
 

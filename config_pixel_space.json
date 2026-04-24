@@ -34,7 +34,8 @@
         "text_dim": 248320,
         "pos_jitter_range": 16,
         "compile_blocks": true,
-        "patch_size": 16
+        "patch_size": 16,
+        "tread_route": [2, 8, 0.5]
     },
     "dino": {
         "strength": 0.1,
