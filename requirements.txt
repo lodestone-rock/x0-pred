@@ -1,0 +1,23 @@
+torchvision==0.25.0
+torch==2.10.0
+einops
+tqdm
+
+# Transformers (tokenizer + optional DINOv2 auxiliary loss)
+transformers
+safetensors
+
+# Image loading
+Pillow
+pillow-jxl-plugin          # JPEG XL support
+opencv-python       # EXR / HDR / 16-bit PNG decoding
+tifffile            # High-bit-depth TIFF support
+
+# Parquet dataloader
+pyarrow
+pandas
+psutil
+requests            # URL-based image loading (optional)
+
+ramtorch
+

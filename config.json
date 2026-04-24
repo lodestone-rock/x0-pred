@@ -1,0 +1,40 @@
+{
+    "batch_size": 128,
+    "lr": 0.0001,
+    "profile": false,
+    "profile_start": 20,
+    "profile_stop": 23,
+    "num_epochs": 1000,
+    "eval_interval": 100,
+    "accum": 1,
+    "warmup": 100,
+    "preview_path": "ramtorch-test/previews",
+    "ckpt_path": "ramtorch-test",
+    "class_dropout_ratio": 0.1,
+    "patch_size": 16,
+    "model_config": {
+        "input_dim": 768,
+        "output_dim": 768,
+        "dim": 768,
+        "num_layers": 12,
+        "num_heads": 12,
+        "exp_fac": 4,
+        "rope_seq_length": 4126,
+        "class_count": 40,
+        "cond_seq_len": 40,
+        "pinch_dim": -1,
+        "n_time_tokens": 4,
+        "n_register_tokens": 8,
+        "use_class_embed": true,
+        "use_text_embed": false,
+        "text_dim": 768,
+        "pos_jitter_range": 0,
+        "compile_blocks": true
+    },
+    "inference_cfg_and_steps": [
+        [1, 1],
+        [1, 30],
+        [3, 30]
+    ],
+    "model_checkpoint": null
+}

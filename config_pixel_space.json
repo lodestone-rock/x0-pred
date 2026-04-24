@@ -1,0 +1,74 @@
+{
+    "batch_size": 8,
+    "lr": 0.0001,
+    "t_mu": 1.0,
+    "profile": false,
+    "profile_start": 20,
+    "profile_stop": 23,
+    "eval_interval": 100,
+    "preview_samples_per_gpu": 4,
+    "preview_quality": 100,
+    "accum": 4,
+    "warmup": 100,
+    "log_every_n_steps": 10,
+    "uncond_ratio": 0.1,
+    "max_text_len": 128,
+    "qwen_tokenizer_path": "Qwen/Qwen3.5-27B",
+    "preview_path": "pixel-space/previews",
+    "ckpt_path": "pixel-space/ckpts",
+    "model_config": {
+        "input_dim": 768,
+        "output_dim": 768,
+        "dim": 768,
+        "num_layers": 12,
+        "num_heads": 12,
+        "exp_fac": 4,
+        "rope_seq_length": 41260,
+        "class_count": 0,
+        "cond_seq_len": 0,
+        "pinch_dim": -1,
+        "n_time_tokens": 4,
+        "n_register_tokens": 8,
+        "use_class_embed": false,
+        "use_text_embed": true,
+        "text_dim": 248320,
+        "pos_jitter_range": 16,
+        "compile_blocks": true,
+        "patch_size": 16
+    },
+    "dino": {
+        "strength": 0.1,
+        "timestep_threshold": 1.0,
+        "model_name": "facebook/dinov3-vitb16"
+    },
+    "parquet_dataloader": {
+        "parquet_sources": {
+            "my_dataset": {
+                "path": "data.parquet",
+                "n_samples": null
+            }
+        },
+        "caption_columns": {
+            "tags": {"weight": 1.0, "is_tag_based": true}
+        },
+        "filename_column": "url",
+        "width_column": "image_width",
+        "height_column": "image_height",
+        "loss_weight_column": null,
+        "image_folder_path": "",
+        "base_resolution": [256],
+        "shuffle_tags": true,
+        "tag_drop_percentage": 0.0,
+        "ratio_cutoff": 2.0,
+        "resolution_step": 64,
+        "num_workers": 4,
+        "prefetch_factor": 2,
+        "offset": 0
+    },
+    "inference_cfg_and_steps": [
+        [1, 1],
+        [1, 30],
+        [3, 30]
+    ],
+    "model_checkpoint": null
+}
