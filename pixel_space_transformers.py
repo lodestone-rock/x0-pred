@@ -16,7 +16,7 @@ All settings are in config.json.
 """
 from __future__ import annotations
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # adjust as needed
+# os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # adjust as needed
 
 import copy
 import csv
@@ -36,7 +36,7 @@ from torchvision.io import write_jpeg
 from torchvision.utils import make_grid, save_image
 from tqdm import tqdm
 
-from ramtorch import AdamW
+from torch.optim import AdamW
 from ramtorch.multi_gpu import MultiGPUWrapper
 
 from src.models.flow import (
@@ -46,6 +46,7 @@ from src.models.flow import (
 )
 from src.dataloaders.parquet_dataloader import ParquetTextImageDataset
 
+# Seed is set at train() entry from config; this is a fallback.
 torch.manual_seed(0)
 
 # ---------------------------------------------------------------------------
@@ -356,7 +357,7 @@ def train(cfg: dict):
 
     wrapper = MultiGPUWrapper(
         model_factory=model_factory,
-        optimizer_factory=lambda params: AdamW(params, lr=cfg["lr"], weight_decay=1e-4),
+        optimizer_factory=lambda params: AdamW(params, lr=cfg["lr"], weight_decay=1e-4, betas=(0.9, 0.95)),
         gradient_accumulation_steps=cfg["accum"],
         max_grad_norm=1.0,
         scheduler_factory=lambda opt: LinearLR(
@@ -369,6 +370,14 @@ def train(cfg: dict):
         wrapper.load_checkpoint(cfg["model_checkpoint"])
     else:
         wrapper.save_checkpoint(os.path.join(cfg["ckpt_path"], "untrained.safetensors"))
+
+    # Lazily compile transformer blocks *after* ramtorch has finished its
+    # FX-tracing setup, to avoid "FX tracing a dynamo-optimized function".
+    if cfg["model_config"].get("compile_blocks", False):
+        print(f"Compiling transformer blocks on {n_gpus} GPU(s)...")
+        for m in wrapper.models:
+            m.compile_blocks()
+        print("  Done.")
 
     # ------------------------------------------------------------------
     # CSV loss log (deferred flush every log_every_n_steps)
@@ -386,10 +395,15 @@ def train(cfg: dict):
     max_text_len = cfg.get("max_text_len", 128)
     t_mu         = cfg.get("t_mu", 0.0)
 
+    master_seed = cfg.get("seed", 42)
+    torch.manual_seed(master_seed)
+
     with make_profiler_ctx(cfg, "ramtorch_trace.json") as prof:
         epoch = 0
         while True:
             epoch += 1
+            # Increment seed each epoch for varied noise/augmentation sampling
+            torch.manual_seed(master_seed + epoch)
             for m in wrapper.models:
                 m.train()
 
@@ -421,16 +435,15 @@ def train(cfg: dict):
 
                 # 2. Backward — per-GPU DINO model passed explicitly
                 with record_function("backward"):
-                    raw_results = []
-                    for gpu_id, out in enumerate(outputs):
-                        r = backward_fn(
-                            gpu_id, wrapper.models[gpu_id], out,
+                    raw_results = wrapper.run_concurrent(
+                        lambda gpu_id: backward_fn(
+                            gpu_id, wrapper.models[gpu_id], outputs[gpu_id],
                             dino_model=dino_models[gpu_id],
                             dino_threshold=dino_threshold,
                             dino_strength=dino_strength,
                             accum_steps=cfg["accum"],
                         )
-                        raw_results.append(r)
+                    )
 
                 total_loss = sum(r[0] for r in raw_results) / n_gpus
                 mse_loss   = sum(r[1] for r in raw_results) / n_gpus
@@ -443,6 +456,8 @@ def train(cfg: dict):
                     wrapper.clip_grads()
                     with record_function("optimizer_step"):
                         wrapper.optimizer_step()
+                        torch.cuda.synchronize()  # ensure all GPU work is done before timing or logging
+                        torch.cuda.empty_cache()
 
                 lr = wrapper.last_lr
                 pbar.set_postfix(loss=f"{total_loss:.4f}", mse=f"{mse_loss:.4f}", dino=f"{dino_loss:.4f}", lr=f"{lr:.2e}", step=global_step)
@@ -451,6 +466,11 @@ def train(cfg: dict):
                 csv_writer.writerow([global_step, f"{total_loss:.6f}", f"{mse_loss:.6f}", f"{dino_loss:.6f}", f"{lr:.2e}", f"{time.time()-t0:.1f}"])
                 if global_step % log_every == 0:
                     csv_file.flush()
+
+                # --- Step checkpoint ---
+                save_every = cfg.get("save_every_n_steps", 0)
+                if save_every > 0 and global_step > 0 and global_step % save_every == 0:
+                    wrapper.save_checkpoint(os.path.join(cfg["ckpt_path"], f"step_{global_step}.safetensors"))
 
                 # --- Preview images (all GPUs in parallel) ---
                 if global_step % cfg["eval_interval"] == 0:

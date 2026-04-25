@@ -320,8 +320,7 @@ class TransformerNetwork(nn.Module):
             )
             for _ in range(num_layers)
         ]
-        if compile_blocks:
-            blocks = [torch.compile(b) for b in blocks]
+        self._compile_blocks = compile_blocks
         self.blocks = nn.ModuleList(blocks)
         self.out_norm = SoftClamp(dim)
         if final_head:
@@ -341,6 +340,15 @@ class TransformerNetwork(nn.Module):
                 f"tread_route selection_rate must be in (0, 1), got {r_rate}"
             )
             self.tread_route = (r_start, r_end, r_rate)
+
+    def compile_blocks(self) -> None:
+        """Compile each transformer block with torch.compile.
+
+        Call this *after* any FX-based model wrapping (e.g. ramtorch
+        MultiGPUWrapper.setup()) to avoid the
+        "FX tracing a dynamo-optimized function" error.
+        """
+        self.blocks = nn.ModuleList([torch.compile(b) for b in self.blocks])
 
     def forward(
         self,
@@ -494,6 +502,15 @@ class Flow(nn.Module):
         if self.use_class_embed:
             nn.init.zeros_(self.class_embed.weight)
             nn.init.zeros_(self.class_embed.bias)
+
+    def compile_blocks(self) -> None:
+        """Lazily compile transformer blocks with torch.compile.
+
+        Call this *after* any FX-based model wrapping (e.g. ramtorch
+        MultiGPUWrapper.setup()) to avoid the
+        \"FX tracing a dynamo-optimized function\" error.
+        """
+        self.transformer.compile_blocks()
 
     @property
     def device(self):
