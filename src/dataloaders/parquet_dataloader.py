@@ -397,6 +397,8 @@ class ParquetTextImageDataset(Dataset):
         offset: int = 0,
         num_reference_images: int | None = None,
         raw_hdr: bool = False,
+        tokenizer=None,
+        max_text_len: int = 128,
     ):
         if base_res is None:
             base_res = [1024]
@@ -425,6 +427,8 @@ class ParquetTextImageDataset(Dataset):
         self.num_reference_images = num_reference_images
         self.offset = offset
         self.raw_hdr = raw_hdr
+        self.tokenizer = tokenizer
+        self.max_text_len = max_text_len
 
         # Normalise caption column weights
         self.caption_columns = caption_columns
@@ -690,6 +694,24 @@ class ParquetTextImageDataset(Dataset):
     def dummy_collate_fn(batch):
         return batch
 
+    def tokenize(self, captions: list[str]) -> "torch.Tensor | None":
+        """Tokenize *captions* in the DataLoader worker process.
+
+        Returns a ``[B, max_text_len]`` int64 CPU tensor when a tokenizer is
+        configured, or ``None`` when no tokenizer is set (no-op / raw-string
+        path stays unchanged).
+        """
+        if self.tokenizer is None:
+            return None
+        enc = self.tokenizer(
+            captions,
+            padding="max_length",
+            truncation=True,
+            max_length=self.max_text_len,
+            return_tensors="pt",
+        )
+        return enc["input_ids"]  # [B, max_text_len] int64, on CPU
+
     def __len__(self) -> int:
         return len(self.batches)
 
@@ -952,8 +974,15 @@ class ParquetTextImageDataset(Dataset):
 
         images = torch.stack(images, dim=0)
 
+        # Tokenize in the worker process so the GPU-thread forward pass gets
+        # pre-computed token ids instead of raw strings.
+        text_out = self.tokenize(training_prompts)
+        # text_out is a Tensor[B, L] when a tokenizer is configured, else None
+        # (in which case we fall back to returning the raw string list).
+        captions_out = text_out if text_out is not None else training_prompts
+
         if self.num_reference_images is not None and reference_images_batch:
             reference_images_batch = torch.stack(reference_images_batch, dim=0)
-            return images, training_prompts, index, loss_weighting, reference_images_batch
+            return images, captions_out, index, loss_weighting, reference_images_batch
 
-        return images, training_prompts, index, loss_weighting
+        return images, captions_out, index, loss_weighting

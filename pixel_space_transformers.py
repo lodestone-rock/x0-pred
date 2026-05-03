@@ -44,6 +44,7 @@ from src.models.flow import (
     sample_from_distribution,
     create_distribution,
 )
+from src.models.flow_baseline import FlowBaseline
 from src.dataloaders.parquet_dataloader import ParquetTextImageDataset
 
 # Seed is set at train() entry from config; this is a fallback.
@@ -99,6 +100,26 @@ def make_profiler_ctx(cfg: dict, trace_path: str):
             print(f"[profiler] Chrome trace saved to {trace_path}"),
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint helpers
+# ---------------------------------------------------------------------------
+
+
+def _strip_compiled_keys(sd: dict) -> dict:
+    """Remove the ``_orig_mod.`` prefix that torch.compile wraps around keys.
+
+    When blocks are compiled with ``torch.compile``, the state dict keys gain
+    a ``_orig_mod.`` prefix (e.g. ``blocks.0._orig_mod.attn.qkv.weight``).
+    Stripping it makes checkpoints loadable by the uncompiled model and keeps
+    the format consistent regardless of whether compile is enabled.
+    """
+    prefix = "_orig_mod."
+    return {
+        k.replace(prefix, "") if prefix in k else k: v
+        for k, v in sd.items()
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -158,7 +179,7 @@ def forward_fn(
     gpu_id: int,
     model: Flow,
     real: torch.Tensor,
-    captions: list[str],
+    captions: "list[str] | torch.Tensor",
     tokenizer,
     dino_model,
     dino_threshold: float,
@@ -166,12 +187,26 @@ def forward_fn(
     max_text_len: int,
     uncond_ratio: float,
     t_mu: float = 0.0,
+    use_mask: bool = False,
+    skip_middle: bool = False,
+    uncond_token_ids: "torch.Tensor | None" = None,
 ) -> tuple:
     """Forward only — returns everything needed for backward.
     All tensors are in [B, C, H, W] image space; no patch flattening here.
+
+    Args:
+        use_mask: run the SPRINT sparse-middle path for this batch
+            (structured group-wise token drop, [MASK]-token padding,
+            dense–sparse residual fusion — arXiv:2510.21986).
+        skip_middle: bypass the middle stack entirely (Path-Drop
+            training — paper §C.1, 10% probability). Trains the model
+            to do PDG inference.
+        Both coin-flips are done in the training loop so all GPUs see
+        the same decision. ``skip_middle`` takes precedence over
+        ``use_mask`` inside ``Flow.forward``.
     """
     device = f"cuda:{gpu_id}"
-    x1 = real.to(device)          # [B, C, H, W]
+    x1 = real.to(device, non_blocking=True)          # [B, C, H, W]
     x0 = torch.randn_like(x1)
 
     B = x1.shape[0]
@@ -181,14 +216,30 @@ def forward_fn(
     noisy_image = x0 * t + x1 * (1 - t)
 
     # Unconditional dropout
-    dropped = ["" if (torch.rand(1).item() < uncond_ratio) else c for c in captions]
-
-    text_ids = None
-    if tokenizer is not None:
-        text_ids = _tokenize_captions(tokenizer, dropped, max_text_len, device)
+    if isinstance(captions, torch.Tensor):
+        # Pre-tokenized path: captions is [B, L] int64 from the dataloader worker.
+        # Apply CFG dropout by replacing selected rows with the pre-tokenized
+        # empty-string ids (uncond_token_ids [1, L]), falling back to an
+        # all-zeros row when uncond_token_ids is not provided.
+        text_ids = captions.to(device, non_blocking=True)
+        if uncond_ratio > 0.0:
+            mask = torch.rand(text_ids.shape[0], device=device) < uncond_ratio
+            if mask.any():
+                if uncond_token_ids is not None:
+                    fill = uncond_token_ids.to(device, non_blocking=True).expand(text_ids.shape[0], -1)
+                else:
+                    fill = torch.zeros_like(text_ids)
+                text_ids = torch.where(mask.unsqueeze(1), fill, text_ids)
+    else:
+        # Raw-string fallback path (no tokenizer configured on the dataset).
+        dropped = ["" if (torch.rand(1).item() < uncond_ratio) else c for c in captions]
+        text_ids = None
+        if tokenizer is not None:
+            text_ids = _tokenize_captions(tokenizer, dropped, max_text_len, device)
 
     with torch.autocast("cuda", torch.bfloat16):
-        predicted_image = model(noisy_image, t, text_tokens=text_ids)
+        predicted_image = model(noisy_image, t, text_tokens=text_ids,
+                                use_mask=use_mask, skip_middle=skip_middle)
 
     return predicted_image, noisy_image, t, x1, text_ids
 
@@ -234,24 +285,67 @@ def preview_fn(
     text_ids: torch.Tensor | None,
     inference_cfg_and_steps: list,
     n_samples: int,
+    tokenizer=None,
+    max_text_len: int = 128,
+    schedule_mu: float | None = None,
 ) -> torch.Tensor:
-    """Run euler_cfg for every (cfg_scale, steps) combo on one GPU.
+    """Run euler_cfg for every combo on one GPU.
 
-    Returns a float32 CPU tensor [(n_combos+1) * n_samples, C, H, W] in [-1, 1],
-    with real samples appended as the last n_samples rows.
+    Each entry in ``inference_cfg_and_steps`` may have 2, 3, or 4 elements::
+
+        [cfg_scale, steps]
+        [cfg_scale, steps, schedule_mu]
+        [cfg_scale, steps, schedule_mu, autoguidance_mode]
+
+    ``schedule_mu`` defaults to the function-level ``schedule_mu`` argument
+    when omitted (pass ``null`` in JSON for uniform-dt / legacy sampling).
+
+    ``autoguidance_mode`` controls the negative guidance pass (default
+    ``"classic"``):
+        ``"classic"`` — full forward, empty text (standard CFG).
+        ``"pdg"``     — Path-Drop Guidance (SPRINT §3.4,
+                        arXiv:2510.21986 Eq. 4): the negative pass bypasses
+                        the middle blocks entirely and uses empty text,
+                        nearly halving inference FLOPs per guided step.
+
+    Returns a float32 CPU tensor [(n_combos+1) * n_samples, C, H, W] in
+    [-1, 1], with real samples appended as the last n_samples rows.
     """
     device = f"cuda:{gpu_id}"
-    x1 = real[:n_samples].to(device)   # [n_samples, C, H, W]
+    x1 = real[:n_samples].to(device, non_blocking=True)   # [n_samples, C, H, W]
     z = torch.randn_like(x1)
 
-    text_ids_dev = text_ids[:n_samples].to(device) if text_ids is not None else None
+    text_ids_dev = text_ids[:n_samples].to(device, non_blocking=True) if text_ids is not None else None
+
+    uncond_text_ids = None
+    if tokenizer is not None:
+        uncond_text_ids = _tokenize_captions(tokenizer, [""] * n_samples, max_text_len, device)
 
     fake_rows = []
     with torch.autocast("cuda", torch.bfloat16):
-        for cfg_scale, steps in inference_cfg_and_steps:
+        for combo in inference_cfg_and_steps:
+            if len(combo) == 2:
+                cfg_scale, steps = combo
+                mu = schedule_mu
+                ag_mode = "classic"
+            elif len(combo) == 3:
+                cfg_scale, steps, mu = combo
+                ag_mode = "classic"
+            elif len(combo) == 4:
+                cfg_scale, steps, mu, ag_mode = combo
+                if mu is None:
+                    mu = schedule_mu
+            else:
+                raise ValueError(
+                    f"inference_cfg_and_steps entry must have 2–4 elements, "
+                    f"got {combo!r}"
+                )
             fake, _ = model.euler_cfg(
-                z, pos_cond=None, cfg_scale=cfg_scale,
+                z, cfg_scale=cfg_scale,
                 num_steps=steps, text_tokens=text_ids_dev,
+                uncond_text_tokens=uncond_text_ids,
+                schedule_mu=mu,
+                autoguidance_mode=ag_mode,
             )
             fake_rows.append(fake.clamp(-1, 1).cpu().float())
 
@@ -280,10 +374,21 @@ def train(cfg: dict):
     # Tokenizer (shared, CPU-based)
     # ------------------------------------------------------------------
     tokenizer = None
+    uncond_token_ids = None
     if cfg.get("qwen_tokenizer_path") and _TRANSFORMERS_AVAILABLE:
         print(f"Loading tokenizer from {cfg['qwen_tokenizer_path']}...")
         tokenizer = AutoTokenizer.from_pretrained(cfg["qwen_tokenizer_path"])
         print(f"  Vocab size: {tokenizer.vocab_size}")
+        # Pre-tokenize the empty string once; used for CFG dropout in forward_fn.
+        _enc = tokenizer(
+            [""],
+            padding="max_length",
+            truncation=True,
+            max_length=cfg.get("max_text_len", 128),
+            return_tensors="pt",
+        )
+        uncond_token_ids = _enc["input_ids"]  # [1, max_text_len] int64, CPU
+        print(f"  Uncond token ids pre-computed (shape {list(uncond_token_ids.shape)}).")
 
     # ------------------------------------------------------------------
     # DINOv3 (one per GPU, frozen)
@@ -338,6 +443,8 @@ def train(cfg: dict):
         rank=0,
         num_gpus=1,
         offset=parquet_cfg.get("offset", 0),
+        tokenizer=tokenizer,
+        max_text_len=cfg.get("max_text_len", 128),
     )
     train_loader = DataLoader(
         dataset,
@@ -352,8 +459,13 @@ def train(cfg: dict):
     # ------------------------------------------------------------------
     # Model
     # ------------------------------------------------------------------
+
+    model_cls = {"flow": Flow, "baseline": FlowBaseline}.get(
+        cfg.get("model_class", "flow"), Flow
+    )
+
     def model_factory():
-        return Flow(**cfg["model_config"])
+        return model_cls(**cfg["model_config"])
 
     wrapper = MultiGPUWrapper(
         model_factory=model_factory,
@@ -366,8 +478,24 @@ def train(cfg: dict):
     )
     wrapper.setup()
 
+    # Patch save_checkpoint to strip torch.compile's _orig_mod. key prefix so
+    # checkpoints are always loadable by the plain (uncompiled) model.
+    _orig_save = wrapper.save_checkpoint
+    def _save_checkpoint_stripped(path: str):
+        import types
+        sd = wrapper.models[0].state_dict()
+        sd = _strip_compiled_keys(sd)
+        from safetensors.torch import save_file as _save_file
+        if path.endswith((".safetensors", ".sft")):
+            _save_file(sd, path)
+        else:
+            torch.save(sd, path)
+        print(f"[MultiGPUWrapper] Saved: {path}")
+    wrapper.save_checkpoint = _save_checkpoint_stripped
+
     if cfg.get("model_checkpoint"):
         wrapper.load_checkpoint(cfg["model_checkpoint"])
+        wrapper.save_checkpoint("debug.safetensors")
     else:
         wrapper.save_checkpoint(os.path.join(cfg["ckpt_path"], "untrained.safetensors"))
 
@@ -390,10 +518,19 @@ def train(cfg: dict):
         csv_writer.writerow(["step", "loss", "mse", "dino", "lr", "time"])
     t0 = time.time()
 
-    global_step  = 0
-    uncond_ratio = cfg.get("uncond_ratio", 0.1)
-    max_text_len = cfg.get("max_text_len", 128)
-    t_mu         = cfg.get("t_mu", 0.0)
+    global_step        = cfg.get("initial_global_step", 0)
+    uncond_ratio       = cfg.get("uncond_ratio", 0.1)
+    max_text_len       = cfg.get("max_text_len", 128)
+    t_mu               = cfg.get("t_mu", 0.0)
+    # SPRINT training coin-flip probabilities (paper §C.1, arXiv:2510.21986):
+    #   sprint_mask_ratio — fraction of steps that run the sparse-middle
+    #     (75% token-drop + [MASK] padding) path. Paper uses 1.0 during
+    #     pretraining, 0.0 during finetuning.
+    #   pdg_drop_ratio    — fraction of steps that bypass the middle stack
+    #     entirely (g_theta output replaced with [MASK]). Trains the model
+    #     for PDG inference. Paper uses 0.1 throughout both stages.
+    sprint_mask_ratio  = cfg.get("sprint_mask_ratio", 1.0)
+    pdg_drop_ratio     = cfg.get("pdg_drop_ratio", 0.1)
 
     master_seed = cfg.get("seed", 42)
     torch.manual_seed(master_seed)
@@ -417,7 +554,17 @@ def train(cfg: dict):
                 # Split across GPUs
                 spg = images.shape[0] // n_gpus
                 image_chunks   = [images[i*spg:(i+1)*spg]   for i in range(n_gpus)]
-                caption_chunks = [captions[i*spg:(i+1)*spg] for i in range(n_gpus)]
+                # captions may be a pre-tokenized Tensor[B, L] (when the dataset
+                # has a tokenizer) or a plain list[str] (fallback / no tokenizer).
+                if isinstance(captions, torch.Tensor):
+                    caption_chunks = [captions[i*spg:(i+1)*spg] for i in range(n_gpus)]
+                else:
+                    caption_chunks = [captions[i*spg:(i+1)*spg] for i in range(n_gpus)]
+
+                # SPRINT coin-flips — one decision shared across all GPUs.
+                # skip_middle takes precedence (PDG path-drop training).
+                skip_middle = torch.rand(1).item() < pdg_drop_ratio
+                use_mask    = (not skip_middle) and torch.rand(1).item() < sprint_mask_ratio
 
                 # 1. Forward
                 with record_function("forward"):
@@ -431,6 +578,9 @@ def train(cfg: dict):
                         max_text_len=max_text_len,
                         uncond_ratio=uncond_ratio,
                         t_mu=t_mu,
+                        use_mask=use_mask,
+                        skip_middle=skip_middle,
+                        uncond_token_ids=uncond_token_ids,
                     )
 
                 # 2. Backward — per-GPU DINO model passed explicitly
@@ -457,7 +607,8 @@ def train(cfg: dict):
                     with record_function("optimizer_step"):
                         wrapper.optimizer_step()
                         torch.cuda.synchronize()  # ensure all GPU work is done before timing or logging
-                        torch.cuda.empty_cache()
+                        if cfg.get("empty_cache_on_step", False):
+                            torch.cuda.empty_cache()  # flush reserved-but-free memory; useful when searching for max batch size, disable once found
 
                 lr = wrapper.last_lr
                 pbar.set_postfix(loss=f"{total_loss:.4f}", mse=f"{mse_loss:.4f}", dino=f"{dino_loss:.4f}", lr=f"{lr:.2e}", step=global_step)
@@ -484,12 +635,21 @@ def train(cfg: dict):
                         for g in range(n_gpus)
                     ]
 
+                    # Default schedule_mu matches training t_mu so previews use
+                    # the same timestep density the model was trained on.
+                    # Set `inference_schedule_mu` in config to override (use
+                    # null for uniform-dt / legacy sampling).
+                    inference_schedule_mu = cfg.get("inference_schedule_mu", t_mu)
+
                     preview_results = wrapper.forward(
                         preview_chunks,
                         forward_fn=preview_fn,
                         eval_mode=True,
                         inference_cfg_and_steps=cfg["inference_cfg_and_steps"],
                         n_samples=preview_spg,
+                        tokenizer=tokenizer,
+                        max_text_len=max_text_len,
+                        schedule_mu=inference_schedule_mu,
                     )
 
                     # Each GPU returns [(n_combos+1)*preview_spg, C, H, W].
@@ -497,7 +657,7 @@ def train(cfg: dict):
                     # each row-group is one CFG combo (+ real at the bottom).
                     all_images = torch.cat(preview_results, dim=0)
                     img_path = f"{cfg['preview_path']}/step_{global_step}.{ext}"
-                    grid = make_grid((all_images + 1) / 2, nrow=preview_spg * n_gpus)
+                    grid = make_grid((all_images + 1) / 2, nrow=preview_spg)
                     if use_png:
                         save_image(grid, img_path)
                     else:

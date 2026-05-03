@@ -1,5 +1,6 @@
 {
     "seed": 42,
+    "initial_global_step": 0,
     "batch_size": 8,
     "lr": 0.0001,
     "t_mu": 1.0,
@@ -13,8 +14,11 @@
     "warmup": 100,
     "log_every_n_steps": 10,
     "save_every_n_steps": 1000,
+    "empty_cache_on_step": false,
     "uncond_ratio": 0.1,
     "max_text_len": 128,
+    "sprint_mask_ratio": 1.0,
+    "pdg_drop_ratio": 0.1,
     "qwen_tokenizer_path": "Qwen/Qwen3.5-27B",
     "preview_path": "pixel-space/previews",
     "ckpt_path": "pixel-space/ckpts",
@@ -22,22 +26,19 @@
         "input_dim": 768,
         "output_dim": 768,
         "dim": 768,
-        "num_layers": 12,
         "num_heads": 12,
         "exp_fac": 4,
         "rope_seq_length": 41260,
-        "class_count": 0,
-        "cond_seq_len": 0,
-        "pinch_dim": -1,
         "n_time_tokens": 4,
         "n_register_tokens": 8,
-        "use_class_embed": false,
         "use_text_embed": true,
         "text_dim": 248320,
         "pos_jitter_range": 16,
         "compile_blocks": true,
         "patch_size": 16,
-        "tread_route": [2, 8, 0.5]
+        "sprint_split": [2, 8, 2],
+        "sprint_group_size": 2,
+        "sprint_keep_per_group": 1
     },
     "dino": {
         "strength": 0.1,
@@ -71,7 +72,8 @@
     "inference_cfg_and_steps": [
         [1, 1],
         [1, 30],
-        [3, 30]
+        [3, 30],
+        [3, 30, null, "pdg"]
     ],
     "model_checkpoint": null
 }

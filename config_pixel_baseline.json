@@ -1,0 +1,79 @@
+{
+    "seed": 2,
+    "initial_global_step": 34000,
+    "batch_size": 48,
+    "lr": 2.1651e-05,
+    "t_mu": 1.0,
+    "empty_cache_on_step": false,
+    "profile": false,
+    "profile_start": 50,
+    "profile_stop": 70,
+    "eval_interval": 500,
+    "preview_samples_per_gpu": 4,
+    "preview_quality": 100,
+    "accum": 1,
+    "warmup": 100,
+    "log_every_n_steps": 10,
+    "save_every_n_steps": 1000,
+    "uncond_ratio": 0.1,
+    "max_text_len": 128,
+    "model_class": "baseline",
+    "qwen_tokenizer_path": "Qwen/Qwen3.5-27B",
+    "preview_path": "pixel-space-stable-rms-baseline/previews",
+    "ckpt_path": "pixel-space-stable-rms-baseline/ckpts",
+    "model_config": {
+        "input_dim": 768,
+        "output_dim": 768,
+        "dim": 2048,
+        "num_heads": 16,
+        "num_layers": 32,
+        "exp_fac": 4,
+        "rope_seq_length": 10000,
+        "n_time_tokens": 4,
+        "n_register_tokens": 8,
+        "use_text_embed": true,
+        "text_dim": 248320,
+        "pos_jitter_range": 32,
+        "compile_blocks": true,
+        "patch_size": 16
+    },
+    "dino": {
+        "strength": 0.1,
+        "timestep_threshold": 1.0,
+        "model_name": "models/facebook/dinov3-vitb16-pretrain-lvd1689m"
+    },
+    "parquet_dataloader": {
+        "parquet_sources": {
+            "e621":       {"path": "datasets/e621",       "n_samples": 2000000},
+            "danbooru":   {"path": "datasets/danbooru",   "n_samples": 2000000},
+            "deviantart": {"path": "datasets/deviantart", "n_samples": 500000},
+            "midjourney": {"path": "datasets/midjourney", "n_samples": 500000},
+            "reddit":     {"path": "datasets/reddit",     "n_samples": 1000000}
+        },
+        "caption_columns": {
+            "tags":                     {"weight": 0.25, "is_tag_based": true},
+            "midjourney_style_summary": {"weight": 0.25, "is_tag_based": false},
+            "brief_summary":            {"weight": 0.25, "is_tag_based": false},
+            "10_word_summary":          {"weight": 0.25, "is_tag_based": false}
+        },
+        "filename_column": "url",
+        "width_column": "image_width",
+        "height_column": "image_height",
+        "loss_weight_column": null,
+        "image_folder_path": "",
+        "base_resolution": [256],
+        "shuffle_tags": true,
+        "tag_drop_percentage": 0.0,
+        "ratio_cutoff": 2.0,
+        "resolution_step": 64,
+        "num_workers": 16,
+        "prefetch_factor": 10,
+        "offset": 0
+    },
+    "inference_cfg_and_steps": [
+        [1, 1, null, "classic"],
+        [3, 50, 1, "classic"],
+        [3, 50, 2, "classic"]
+    ],
+    "model_checkpoint": "pixel-space-stable-rms-baseline/step_34000_fixed.safetensors"
+}
