@@ -43,6 +43,7 @@ from src.models.flow import (
     Flow,
     sample_from_distribution,
     create_distribution,
+    compute_timestep_weights,
 )
 from src.models.flow_baseline import FlowBaseline
 from src.dataloaders.parquet_dataloader import ParquetTextImageDataset
@@ -187,6 +188,7 @@ def forward_fn(
     max_text_len: int,
     uncond_ratio: float,
     t_mu: float = 0.0,
+    t_shift_mode: str = "sampled",
     use_mask: bool = False,
     skip_middle: bool = False,
     uncond_token_ids: "torch.Tensor | None" = None,
@@ -195,6 +197,11 @@ def forward_fn(
     All tensors are in [B, C, H, W] image space; no patch flattening here.
 
     Args:
+        t_shift_mode: controls how the timestep shift is applied.
+            ``"sampled"``  — original behaviour: sample t from the shifted
+                distribution (non-uniform t values, no loss weighting).
+            ``"weighted"`` — sample t uniformly then weight the per-sample
+                loss by the shifted density, keeping t ~ Uniform[0,1].
         use_mask: run the SPRINT sparse-middle path for this batch
             (structured group-wise token drop, [MASK]-token padding,
             dense–sparse residual fusion — arXiv:2510.21986).
@@ -210,8 +217,16 @@ def forward_fn(
     x0 = torch.randn_like(x1)
 
     B = x1.shape[0]
-    x_dist, probabilities = create_distribution(1000, device=device, mu=t_mu)
-    t = sample_from_distribution(x_dist, probabilities, B)[:, None, None, None].to(x1.dtype)
+    if t_shift_mode == "weighted":
+        # Uniform t; shift applied via per-sample loss weights in backward_fn.
+        t_flat   = torch.rand(B, device=device)
+        t_weights = compute_timestep_weights(t_flat, mu=t_mu)
+        t = t_flat[:, None, None, None].to(x1.dtype)
+    else:
+        # Original: sample from the shifted distribution.
+        x_dist, probabilities = create_distribution(1000, device=device, mu=t_mu)
+        t = sample_from_distribution(x_dist, probabilities, B)[:, None, None, None].to(x1.dtype)
+        t_weights = None
 
     noisy_image = x0 * t + x1 * (1 - t)
 
@@ -241,7 +256,7 @@ def forward_fn(
         predicted_image = model(noisy_image, t, text_tokens=text_ids,
                                 use_mask=use_mask, skip_middle=skip_middle)
 
-    return predicted_image, noisy_image, t, x1, text_ids
+    return predicted_image, noisy_image, t, x1, text_ids, t_weights
 
 
 def backward_fn(
@@ -254,21 +269,30 @@ def backward_fn(
     accum_steps: int = 1,
 ) -> tuple[float, float, float]:
     """Backward only — returns (total_loss, mse_loss, dino_loss)."""
-    predicted_image, noisy_image, t, x1, text_ids = output
+    predicted_image, noisy_image, t, x1, text_ids, t_weights = output
     device = predicted_image.device
     t_scalar = t.view(-1)
 
     target_velocity    = (noisy_image - x1) / (t + 5e-2)
     predicted_velocity = (noisy_image - predicted_image) / (t + 5e-2)
 
-    mse = F.mse_loss(predicted_velocity, target_velocity)
+    if t_weights is not None:
+        # Weighted mode: per-sample MSE averaged with importance weights.
+        per_sample_mse = F.mse_loss(predicted_velocity, target_velocity,
+                                    reduction="none").mean(dim=[1, 2, 3])
+        mse = (per_sample_mse * t_weights.to(device)).mean()
+    else:
+        mse = F.mse_loss(predicted_velocity, target_velocity)
 
     if dino_model is not None and dino_strength > 0.0:
         dino_per_sample = _compute_dino_loss(
             dino_model, predicted_image, x1,
             t_scalar, dino_threshold, str(device),
         )
-        dino_term = dino_per_sample.mean() * dino_strength
+        if t_weights is not None:
+            dino_term = (dino_per_sample * t_weights.to(device)).mean() * dino_strength
+        else:
+            dino_term = dino_per_sample.mean() * dino_strength
         total = mse + dino_term
     else:
         dino_term = mse.new_zeros(1)
@@ -515,13 +539,23 @@ def train(cfg: dict):
     csv_file   = open(csv_path, "a", newline="")
     csv_writer = csv.writer(csv_file)
     if os.path.getsize(csv_path) == 0:
-        csv_writer.writerow(["step", "loss", "mse", "dino", "lr", "time"])
+        csv_writer.writerow(["step", "loss", "mse", "dino", "lr", "t_mu", "time"])
     t0 = time.time()
 
     global_step        = cfg.get("initial_global_step", 0)
     uncond_ratio       = cfg.get("uncond_ratio", 0.1)
     max_text_len       = cfg.get("max_text_len", 128)
     t_mu               = cfg.get("t_mu", 0.0)
+    # Linear t_mu annealing: decays from t_mu_start → t_mu_end over
+    # t_mu_anneal_steps steps, then holds at t_mu_end.
+    # When t_mu_anneal_steps is 0 (default), t_mu is static.
+    t_mu_start         = cfg.get("t_mu_start", t_mu)
+    t_mu_end           = cfg.get("t_mu_end", 1.0)
+    t_mu_anneal_steps  = cfg.get("t_mu_anneal_steps", 0)
+    # Timestep shift mode for ablations:
+    #   "sampled"  — original: sample t from the shifted distribution (default)
+    #   "weighted" — sample t uniformly, weight per-sample loss by shifted density
+    t_shift_mode       = cfg.get("t_shift_mode", "sampled")
     # SPRINT training coin-flip probabilities (paper §C.1, arXiv:2510.21986):
     #   sprint_mask_ratio — fraction of steps that run the sparse-middle
     #     (75% token-drop + [MASK] padding) path. Paper uses 1.0 during
@@ -561,6 +595,11 @@ def train(cfg: dict):
                 else:
                     caption_chunks = [captions[i*spg:(i+1)*spg] for i in range(n_gpus)]
 
+                # Anneal t_mu linearly from t_mu_start → t_mu_end.
+                if t_mu_anneal_steps > 0:
+                    frac = min(global_step, t_mu_anneal_steps) / t_mu_anneal_steps
+                    t_mu = t_mu_start + (t_mu_end - t_mu_start) * frac
+
                 # SPRINT coin-flips — one decision shared across all GPUs.
                 # skip_middle takes precedence (PDG path-drop training).
                 skip_middle = torch.rand(1).item() < pdg_drop_ratio
@@ -578,6 +617,7 @@ def train(cfg: dict):
                         max_text_len=max_text_len,
                         uncond_ratio=uncond_ratio,
                         t_mu=t_mu,
+                        t_shift_mode=t_shift_mode,
                         use_mask=use_mask,
                         skip_middle=skip_middle,
                         uncond_token_ids=uncond_token_ids,
@@ -611,10 +651,10 @@ def train(cfg: dict):
                             torch.cuda.empty_cache()  # flush reserved-but-free memory; useful when searching for max batch size, disable once found
 
                 lr = wrapper.last_lr
-                pbar.set_postfix(loss=f"{total_loss:.4f}", mse=f"{mse_loss:.4f}", dino=f"{dino_loss:.4f}", lr=f"{lr:.2e}", step=global_step)
+                pbar.set_postfix(loss=f"{total_loss:.4f}", mse=f"{mse_loss:.4f}", dino=f"{dino_loss:.4f}", lr=f"{lr:.2e}", t_mu=f"{t_mu:.3f}", step=global_step)
 
                 # Deferred CSV write
-                csv_writer.writerow([global_step, f"{total_loss:.6f}", f"{mse_loss:.6f}", f"{dino_loss:.6f}", f"{lr:.2e}", f"{time.time()-t0:.1f}"])
+                csv_writer.writerow([global_step, f"{total_loss:.6f}", f"{mse_loss:.6f}", f"{dino_loss:.6f}", f"{lr:.2e}", f"{t_mu:.4f}", f"{time.time()-t0:.1f}"])
                 if global_step % log_every == 0:
                     csv_file.flush()
 
@@ -635,8 +675,9 @@ def train(cfg: dict):
                         for g in range(n_gpus)
                     ]
 
-                    # Default schedule_mu matches training t_mu so previews use
-                    # the same timestep density the model was trained on.
+                    # Default schedule_mu matches the *current* (annealed) t_mu
+                    # so previews use the same timestep density the model was
+                    # trained on at this point in training.
                     # Set `inference_schedule_mu` in config to override (use
                     # null for uniform-dt / legacy sampling).
                     inference_schedule_mu = cfg.get("inference_schedule_mu", t_mu)

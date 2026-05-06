@@ -837,3 +837,47 @@ def create_distribution(num_points, device=None, mu: float = 0.0):
     if mu != 0.0:
         x = time_shift(x, mu)
     return x, probabilities
+
+
+def compute_timestep_weights(
+    t: torch.Tensor,
+    mu: float,
+    num_points: int = 1000,
+) -> torch.Tensor:
+    """Compute per-sample importance weights for uniform timestep sampling.
+
+    Given timesteps ``t`` sampled from Uniform[0, 1], returns weights
+    proportional to the shifted density at each ``t``, normalised so that
+    the batch mean equals 1.  Multiplying the per-sample loss by these
+    weights is equivalent to sampling from the shifted distribution.
+
+    When ``mu == 0`` all weights are exactly 1 (flat density).
+
+    Args:
+        t:          1-D tensor of timesteps in [0, 1], shape [B].
+        mu:         Logit-space shift (same value used in ``create_distribution``).
+        num_points: Resolution of the reference density grid.
+
+    Returns:
+        Tensor of shape [B] with non-negative weights, mean ≈ 1.
+    """
+    if mu == 0.0:
+        return torch.ones_like(t)
+
+    # Build the shifted grid and its base density (same as create_distribution).
+    x_shifted, p_base = create_distribution(num_points, device=t.device, mu=mu)
+    x_shifted = x_shifted.to(t.dtype)
+    p_base    = p_base.to(t.dtype)
+
+    # For each sampled t, find its position in the shifted grid and
+    # linearly interpolate the density value.
+    t_flat = t.view(-1).clamp(x_shifted[0], x_shifted[-1])
+    idx    = torch.searchsorted(x_shifted.contiguous(), t_flat.contiguous()).clamp(1, num_points - 1)
+    x_lo, x_hi = x_shifted[idx - 1], x_shifted[idx]
+    p_lo, p_hi = p_base[idx - 1],    p_base[idx]
+    frac    = (t_flat - x_lo) / (x_hi - x_lo).clamp(min=1e-8)
+    weights = p_lo + frac * (p_hi - p_lo)
+
+    # Normalise so the batch mean is 1 (keeps loss scale stable).
+    weights = weights / weights.mean().clamp(min=1e-8)
+    return weights
