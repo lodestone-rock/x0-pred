@@ -196,7 +196,7 @@ class GLU(nn.Module):
         self.wi_0 = nn.Linear(dim, dim * exp_fac, bias=False)
         self.wi_1 = nn.Linear(dim, dim * exp_fac, bias=False)
         self.wo = nn.Linear(dim * exp_fac, dim, bias=True)
-        self.layer_norm = nn.RMSNorm(dim, elementwise_affine=False)
+        self.layer_norm = nn.RMSNorm(dim, elementwise_affine=True)
         nn.init.zeros_(self.wo.weight)
         self.use_compiled = False
 

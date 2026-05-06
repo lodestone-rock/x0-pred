@@ -367,8 +367,9 @@ def train(cfg: dict):
     # ------------------------------------------------------------------
     os.makedirs(cfg["ckpt_path"], exist_ok=True)
     os.makedirs(cfg["preview_path"], exist_ok=True)
-    shutil.copy(CONFIG_PATH, os.path.join(cfg["ckpt_path"], "config.json"))
-    print(f"Config saved to {cfg['ckpt_path']}/config.json")
+    _cfg_dest = os.path.join(cfg["ckpt_path"], os.path.basename(CONFIG_PATH))
+    shutil.copy(CONFIG_PATH, _cfg_dest)
+    print(f"Config saved to {_cfg_dest}")
 
     # ------------------------------------------------------------------
     # Tokenizer (shared, CPU-based)
@@ -495,7 +496,6 @@ def train(cfg: dict):
 
     if cfg.get("model_checkpoint"):
         wrapper.load_checkpoint(cfg["model_checkpoint"])
-        wrapper.save_checkpoint("debug.safetensors")
     else:
         wrapper.save_checkpoint(os.path.join(cfg["ckpt_path"], "untrained.safetensors"))
 
@@ -682,10 +682,31 @@ def train(cfg: dict):
 # Entry point
 # ---------------------------------------------------------------------------
 
+def load_config(path: str) -> dict:
+    """Load a JSON or YAML config file.
+
+    YAML files (``.yaml`` / ``.yml``) support comments (``#``) and are
+    otherwise equivalent to JSON for this trainer.  The ``pyyaml`` package
+    must be installed (``pip install pyyaml``) to use YAML configs.
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".yaml", ".yml"):
+        try:
+            import yaml
+        except ImportError as e:
+            raise ImportError(
+                "pyyaml is required for YAML configs: pip install pyyaml"
+            ) from e
+        with open(path) as f:
+            return yaml.safe_load(f)
+    else:
+        with open(path) as f:
+            return json.load(f)
+
+
 if __name__ == "__main__":
     CONFIG_PATH = sys.argv[1] if len(sys.argv) > 1 else "config_pixel_space.json"
     print(f"Loading config from: {CONFIG_PATH}")
-    with open(CONFIG_PATH) as f:
-        TRAINING_CONFIG = json.load(f)
+    TRAINING_CONFIG = load_config(CONFIG_PATH)
 
     train(TRAINING_CONFIG)
