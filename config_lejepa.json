@@ -1,0 +1,75 @@
+{
+    "seed": 42,
+    "initial_global_step": 0,
+    "batch_size": 48,
+    "lr": 2e-4,
+    "empty_cache_on_step": false,
+    "profile": false,
+    "profile_start": 50,
+    "profile_stop": 70,
+    "eval_interval": 500,
+    "preview_samples_per_gpu": 4,
+    "preview_quality": 95,
+    "accum": 1,
+    "warmup": 1000,
+    "log_every_n_steps": 10,
+    "save_every_n_steps": 1000,
+
+    "preview_path": "lejepa-run/previews",
+    "ckpt_path": "lejepa-run/ckpts",
+
+    "model_checkpoint": null,
+
+    "V": 4,
+    "lamb": 0.02,
+
+    "sigreg_knots": 17,
+    "sigreg_t_max": 3.0,
+    "sigreg_n_proj": 256,
+
+    "aug_scale_min": 0.08,
+    "aug_scale_max": 1.0,
+    "aug_color_jitter_strength": 0.8,
+    "aug_blur_prob": 0.5,
+    "aug_solarize_prob": 0.2,
+
+    "model_config": {
+        "input_dim": 768,
+        "dim": 2048,
+        "num_heads": 16,
+        "num_layers": 32,
+        "exp_fac": 4,
+        "rope_seq_length": 10000,
+        "n_register_tokens": 8,
+        "pos_jitter_range": 32,
+        "compile_blocks": false,
+        "patch_size": 16,
+        "proj_dim": 128
+    },
+
+    "parquet_dataloader": {
+        "parquet_sources": {
+            "e621":       {"path": "datasets/e621",       "n_samples": 2000000},
+            "danbooru":   {"path": "datasets/danbooru",   "n_samples": 2000000},
+            "deviantart": {"path": "datasets/deviantart", "n_samples": 500000},
+            "midjourney": {"path": "datasets/midjourney", "n_samples": 500000},
+            "reddit":     {"path": "datasets/reddit",     "n_samples": 1000000}
+        },
+        "caption_columns": {
+            "tags": {"weight": 1.0, "is_tag_based": true}
+        },
+        "filename_column": "url",
+        "width_column": "image_width",
+        "height_column": "image_height",
+        "loss_weight_column": null,
+        "image_folder_path": "",
+        "base_resolution": [256],
+        "shuffle_tags": false,
+        "tag_drop_percentage": 0.0,
+        "ratio_cutoff": 2.0,
+        "resolution_step": 64,
+        "num_workers": 16,
+        "prefetch_factor": 10,
+        "offset": 0
+    }
+}
