@@ -231,6 +231,8 @@ def forward_fn(
     noisy_image = x0 * t + x1 * (1 - t)
 
     # Unconditional dropout
+    is_uncond_mask = torch.zeros(B, dtype=torch.bool, device=device)
+
     if isinstance(captions, torch.Tensor):
         # Pre-tokenized path: captions is [B, L] int64 from the dataloader worker.
         # Apply CFG dropout by replacing selected rows with the pre-tokenized
@@ -245,9 +247,13 @@ def forward_fn(
                 else:
                     fill = torch.zeros_like(text_ids)
                 text_ids = torch.where(mask.unsqueeze(1), fill, text_ids)
+            is_uncond_mask = mask
     else:
         # Raw-string fallback path (no tokenizer configured on the dataset).
         dropped = ["" if (torch.rand(1).item() < uncond_ratio) else c for c in captions]
+        is_uncond_mask = torch.tensor(
+            [c == "" for c in dropped], dtype=torch.bool, device=device
+        )
         text_ids = None
         if tokenizer is not None:
             text_ids = _tokenize_captions(tokenizer, dropped, max_text_len, device)
@@ -256,7 +262,7 @@ def forward_fn(
         predicted_image = model(noisy_image, t, text_tokens=text_ids,
                                 use_mask=use_mask, skip_middle=skip_middle)
 
-    return predicted_image, noisy_image, t, x1, text_ids, t_weights
+    return predicted_image, noisy_image, t, x1, text_ids, t_weights, is_uncond_mask
 
 
 def backward_fn(
@@ -269,7 +275,7 @@ def backward_fn(
     accum_steps: int = 1,
 ) -> tuple[float, float, float]:
     """Backward only — returns (total_loss, mse_loss, dino_loss)."""
-    predicted_image, noisy_image, t, x1, text_ids, t_weights = output
+    predicted_image, noisy_image, t, x1, text_ids, t_weights, *_ = output
     device = predicted_image.device
     t_scalar = t.view(-1)
 
@@ -278,6 +284,101 @@ def backward_fn(
 
     if t_weights is not None:
         # Weighted mode: per-sample MSE averaged with importance weights.
+        per_sample_mse = F.mse_loss(predicted_velocity, target_velocity,
+                                    reduction="none").mean(dim=[1, 2, 3])
+        mse = (per_sample_mse * t_weights.to(device)).mean()
+    else:
+        mse = F.mse_loss(predicted_velocity, target_velocity)
+
+    if dino_model is not None and dino_strength > 0.0:
+        dino_per_sample = _compute_dino_loss(
+            dino_model, predicted_image, x1,
+            t_scalar, dino_threshold, str(device),
+        )
+        if t_weights is not None:
+            dino_term = (dino_per_sample * t_weights.to(device)).mean() * dino_strength
+        else:
+            dino_term = dino_per_sample.mean() * dino_strength
+        total = mse + dino_term
+    else:
+        dino_term = mse.new_zeros(1)
+        total = mse
+
+    (total / accum_steps).backward()
+    return total.item(), mse.item(), dino_term.item()
+
+
+def cfg_amplifying_backward_fn(
+    gpu_id: int,
+    model: Flow,
+    output: tuple,
+    teacher_model,
+    cfg_scale: float,
+    uncond_token_ids: "torch.Tensor | None",
+    dino_model,
+    dino_threshold: float,
+    dino_strength: float,
+    accum_steps: int = 1,
+) -> tuple[float, float, float]:
+    """CFG-amplifying backward pass — returns (total_loss, mse_loss, dino_loss).
+
+    Uncond samples (is_uncond_mask == True) use the standard flow-matching
+    target: ``target_velocity = (noisy_image - x1) / (t + 5e-2)``.
+
+    Cond samples (is_uncond_mask == False) chase the teacher model's own CFG
+    output (stop-grad), baking the guidance strength into the model weights:
+
+        x0_cfg = x0_neg + cfg_scale * (x0_pos - x0_neg)
+        cfg_target_velocity = (noisy_image - x0_cfg) / (t + 5e-2)
+
+    ``teacher_model`` is either an EMA copy of the model (recommended) or the
+    current model itself (both under torch.no_grad so no gradients flow back).
+    """
+    predicted_image, noisy_image, t, x1, text_ids, t_weights, is_uncond_mask = output
+    device = predicted_image.device
+    t_scalar = t.view(-1)
+
+    B = predicted_image.shape[0]
+    eps = 5e-2
+
+    # --- Build mixed target_velocity ---
+    # Start with the standard flow target for all samples; overwrite cond rows.
+    target_velocity = (noisy_image - x1) / (t + eps)
+
+    cond_idx = (~is_uncond_mask).nonzero(as_tuple=True)[0]
+    if cond_idx.numel() > 0:
+        noisy_cond = noisy_image[cond_idx]
+        t_cond     = t[cond_idx]
+        text_cond  = text_ids[cond_idx] if text_ids is not None else None
+
+        # Build uncond fill for the teacher's negative pass.
+        if uncond_token_ids is not None:
+            uncond_fill = uncond_token_ids.to(device, non_blocking=True).expand(
+                cond_idx.numel(), -1
+            )
+        else:
+            uncond_fill = torch.zeros_like(text_cond) if text_cond is not None else None
+
+        with torch.no_grad(), torch.autocast("cuda", torch.bfloat16):
+            x0_pos = teacher_model(noisy_cond, t_cond, text_tokens=text_cond)
+            x0_neg = teacher_model(noisy_cond, t_cond, text_tokens=uncond_fill)
+
+        # Blend in velocity space (x0 is a point, not a direction), then
+        # recover the CFG-guided x0 point and apply the standard training
+        # target formula — consistent with backward_fn and safe at t ≈ 0.
+        x0_pos = x0_pos.to(noisy_cond.dtype)
+        x0_neg = x0_neg.to(noisy_cond.dtype)
+        v_pos = (x0_pos - noisy_cond) / t_cond
+        v_neg = (x0_neg - noisy_cond) / t_cond
+        v_cfg = v_neg + cfg_scale * (v_pos - v_neg)
+        # Recover the CFG-guided x0 point from the blended velocity.
+        x0_cfg = noisy_cond + v_cfg * t_cond
+        cfg_target = (noisy_cond - x0_cfg) / (t_cond + eps)
+        target_velocity[cond_idx] = cfg_target
+
+    predicted_velocity = (noisy_image - predicted_image) / (t + eps)
+
+    if t_weights is not None:
         per_sample_mse = F.mse_loss(predicted_velocity, target_velocity,
                                     reduction="none").mean(dim=[1, 2, 3])
         mse = (per_sample_mse * t_weights.to(device)).mean()
@@ -532,6 +633,27 @@ def train(cfg: dict):
         print("  Done.")
 
     # ------------------------------------------------------------------
+    # CFG-amplifying mode setup
+    # ------------------------------------------------------------------
+    cfg_amp_cfg     = cfg.get("cfg_amplifying", {})
+    cfg_amp_enabled = cfg_amp_cfg.get("enabled", False)
+    cfg_amp_scale   = float(cfg_amp_cfg.get("cfg_scale", 3.0))
+    ema_enabled     = cfg_amp_cfg.get("ema_enabled", True)
+    ema_decay       = float(cfg_amp_cfg.get("ema_decay", 0.9999))
+
+    ema_models: list = []
+    if cfg_amp_enabled and ema_enabled:
+        print(f"CFG-amplifying: building EMA models (decay={ema_decay}) on {n_gpus} GPU(s)...")
+        for gpu_id in range(n_gpus):
+            ema_m = copy.deepcopy(wrapper.models[gpu_id]).to(f"cuda:{gpu_id}").eval()
+            for p in ema_m.parameters():
+                p.requires_grad_(False)
+            ema_models.append(ema_m)
+        print("  EMA models ready.")
+    elif cfg_amp_enabled:
+        print("CFG-amplifying: EMA disabled — using live model weights as teacher.")
+
+    # ------------------------------------------------------------------
     # CSV loss log (deferred flush every log_every_n_steps)
     # ------------------------------------------------------------------
     log_every  = cfg.get("log_every_n_steps", 10)
@@ -625,15 +747,30 @@ def train(cfg: dict):
 
                 # 2. Backward — per-GPU DINO model passed explicitly
                 with record_function("backward"):
-                    raw_results = wrapper.run_concurrent(
-                        lambda gpu_id: backward_fn(
-                            gpu_id, wrapper.models[gpu_id], outputs[gpu_id],
-                            dino_model=dino_models[gpu_id],
-                            dino_threshold=dino_threshold,
-                            dino_strength=dino_strength,
-                            accum_steps=cfg["accum"],
+                    if cfg_amp_enabled:
+                        _teacher_models = ema_models if ema_models else wrapper.models
+                        raw_results = wrapper.run_concurrent(
+                            lambda gpu_id: cfg_amplifying_backward_fn(
+                                gpu_id, wrapper.models[gpu_id], outputs[gpu_id],
+                                teacher_model=_teacher_models[gpu_id],
+                                cfg_scale=cfg_amp_scale,
+                                uncond_token_ids=uncond_token_ids,
+                                dino_model=dino_models[gpu_id],
+                                dino_threshold=dino_threshold,
+                                dino_strength=dino_strength,
+                                accum_steps=cfg["accum"],
+                            )
                         )
-                    )
+                    else:
+                        raw_results = wrapper.run_concurrent(
+                            lambda gpu_id: backward_fn(
+                                gpu_id, wrapper.models[gpu_id], outputs[gpu_id],
+                                dino_model=dino_models[gpu_id],
+                                dino_threshold=dino_threshold,
+                                dino_strength=dino_strength,
+                                accum_steps=cfg["accum"],
+                            )
+                        )
 
                 total_loss = sum(r[0] for r in raw_results) / n_gpus
                 mse_loss   = sum(r[1] for r in raw_results) / n_gpus
@@ -649,6 +786,16 @@ def train(cfg: dict):
                         torch.cuda.synchronize()  # ensure all GPU work is done before timing or logging
                         if cfg.get("empty_cache_on_step", False):
                             torch.cuda.empty_cache()  # flush reserved-but-free memory; useful when searching for max batch size, disable once found
+
+                    # EMA update — runs after every optimizer step.
+                    if cfg_amp_enabled and ema_models:
+                        with torch.no_grad():
+                            for gpu_id in range(n_gpus):
+                                for ema_p, p in zip(
+                                    ema_models[gpu_id].parameters(),
+                                    wrapper.models[gpu_id].parameters(),
+                                ):
+                                    ema_p.mul_(ema_decay).add_(p.data, alpha=1.0 - ema_decay)
 
                 lr = wrapper.last_lr
                 pbar.set_postfix(loss=f"{total_loss:.4f}", mse=f"{mse_loss:.4f}", dino=f"{dino_loss:.4f}", lr=f"{lr:.2e}", t_mu=f"{t_mu:.3f}", step=global_step)
