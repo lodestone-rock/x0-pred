@@ -44,7 +44,8 @@
         "pos_jitter_range": 32,
         "compile_blocks": false,
         "patch_size": 16,
-        "proj_dim": 128
+        "proj_dim": 128,
+        "proj_norm": "batchnorm"
     },
 
     "parquet_dataloader": {

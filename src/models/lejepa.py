@@ -96,6 +96,41 @@ class SIGReg(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# SoftClamp — pointwise learnable centering/scaling norm
+# ---------------------------------------------------------------------------
+
+def _soft_clamp(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    alpha: torch.Tensor,
+    shift: torch.Tensor,
+) -> torch.Tensor:
+    return scale * torch.tanh(x * alpha) + shift
+
+
+class SoftClamp(nn.Module):
+    """Pointwise learnable norm: scale * tanh(x * alpha) + shift.
+
+    A lightweight alternative to BatchNorm1d for the projector head.
+    Unlike BN it has no batch-size dependency and no running statistics —
+    purely pointwise centering and bounded output.
+
+    alpha (scalar) controls the saturation point; initialised to 0.5 so the
+    function is nearly linear near zero at the start of training.
+    scale and shift are per-feature (dim,) vectors.
+    """
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.alpha = nn.Parameter(torch.ones(1) * 0.5)
+        self.scale = nn.Parameter(torch.ones(dim))
+        self.shift = nn.Parameter(torch.zeros(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return _soft_clamp(x, self.scale, self.alpha, self.shift)
+
+
+# ---------------------------------------------------------------------------
 # LeJEPA Encoder
 # ---------------------------------------------------------------------------
 
@@ -106,8 +141,11 @@ class LeJEPAEncoder(nn.Module):
         [CLS (1)] [register tokens (n_register_tokens)] [image patches (H*W)]
 
     The CLS token output is used as the image-level embedding.  A 3-layer MLP
-    projector (with BatchNorm1d) maps it to the projection space used by the
-    SIGReg + invariance loss.
+    projector maps it to the projection space used by the SIGReg + invariance
+    loss.  The norm layer inside the projector is controlled by ``proj_norm``:
+
+        ``"batchnorm"``  — nn.BatchNorm1d (original LeJEPA design)
+        ``"softclamp"``  — SoftClamp pointwise tanh centering (no batch stats)
 
     ``encode_patches`` returns the raw patch token features (after the
     transformer's output norm, before the projector) for PCA visualisation.
@@ -126,7 +164,14 @@ class LeJEPAEncoder(nn.Module):
         compile_blocks: bool = False,
         patch_size: int = 16,
         proj_dim: int = 128,
+        proj_norm: str = "batchnorm",
     ):
+        """
+        Args:
+            proj_norm: Norm layer used inside the projector MLP.
+                ``"batchnorm"`` — nn.BatchNorm1d (original LeJEPA, empirically critical).
+                ``"softclamp"`` — SoftClamp pointwise tanh centering (no batch-size dependency).
+        """
         super().__init__()
         self.dim = dim
         self._patch_size = patch_size
@@ -159,12 +204,22 @@ class LeJEPAEncoder(nn.Module):
             compile_blocks=compile_blocks,
         )
 
-        # --- Projector head (original LeJEPA design) ---
-        # BatchNorm1d is empirically critical — do not replace with LayerNorm.
+        # --- Projector head ---
+        # proj_norm selects the norm layer inside the MLP:
+        #   "batchnorm" — nn.BatchNorm1d (original LeJEPA design, empirically critical)
+        #   "softclamp" — SoftClamp pointwise tanh centering (no batch-size dependency)
+        _valid_norms = ("batchnorm", "softclamp")
+        if proj_norm not in _valid_norms:
+            raise ValueError(f"proj_norm must be one of {_valid_norms}, got {proj_norm!r}")
+        norm_factory = (
+            (lambda c: nn.BatchNorm1d(c))
+            if proj_norm == "batchnorm"
+            else (lambda c: SoftClamp(c))
+        )
         self.projector = MLP(
             in_channels=dim,
             hidden_channels=[2048, 2048, proj_dim],
-            norm_layer=lambda c: nn.BatchNorm1d(c),
+            norm_layer=norm_factory,
             activation_layer=nn.GELU,
         )
 
