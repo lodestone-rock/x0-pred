@@ -1,0 +1,89 @@
+{
+    "seed": 42,
+    "initial_global_step": 0,
+    "batch_size": 4,
+    "lr": 0.0001,
+    "t_mu": 1.0,
+    "t_mu_start": 1.0,
+    "t_mu_end": 1.0,
+    "t_mu_anneal_steps": 0,
+    "t_shift_mode": "sampled",
+    "schedule_shift": true,
+    "profile": false,
+    "profile_start": 20,
+    "profile_stop": 23,
+    "eval_interval": 100,
+    "preview_samples_per_gpu": 4,
+    "preview_quality": 100,
+    "accum": 4,
+    "warmup": 100,
+    "log_every_n_steps": 10,
+    "save_every_n_steps": 1000,
+    "empty_cache_on_step": false,
+    "uncond_ratio": 0.1,
+    "max_seq_len": 512,
+    "qwen_path": "models/qwen3",
+    "preview_path": "zeta-run/previews",
+    "ckpt_path": "zeta-run/ckpts",
+    "model_config": {
+        "spatial_patch_size": 32,
+        "patch_size": 1,
+        "f_patch_size": 1,
+        "in_channels": 3072,
+        "dim": 3840,
+        "n_layers": 30,
+        "n_refiner_layers": 2,
+        "n_heads": 30,
+        "n_kv_heads": 30,
+        "norm_eps": 1e-5,
+        "qk_norm": true,
+        "cap_feat_dim": 2560,
+        "rope_theta": 256,
+        "t_scale": 1000.0,
+        "axes_dims": [32, 48, 48],
+        "axes_lens": [1536, 512, 512],
+        "adaln_embed_dim": 256,
+        "decoder_hidden_size": 3840,
+        "decoder_num_res_blocks": 4,
+        "decoder_max_freqs": 8,
+        "pos_jitter_range": 16,
+        "grad_checkpointing": true,
+        "compile_blocks": false
+    },
+    "dino": {
+        "strength": 0.0,
+        "timestep_threshold": 1.0,
+        "model_name": "facebook/dinov2-base"
+    },
+    "parquet_dataloader": {
+        "parquet_sources": {
+            "my_dataset": {
+                "path": "data.parquet",
+                "n_samples": null
+            }
+        },
+        "caption_columns": {
+            "tags": {"weight": 1.0, "is_tag_based": true}
+        },
+        "filename_column": "url",
+        "width_column": "image_width",
+        "height_column": "image_height",
+        "loss_weight_column": null,
+        "image_folder_path": "",
+        "base_resolution": [256],
+        "shuffle_tags": true,
+        "tag_drop_percentage": 0.0,
+        "ratio_cutoff": 2.0,
+        "resolution_step": 64,
+        "num_workers": 4,
+        "prefetch_factor": 2,
+        "offset": 0
+    },
+    "inference_cfg_and_steps": [
+        [1, 1],
+        [1, 28],
+        [4, 28],
+        [4, 28, false]
+    ],
+    "model_checkpoint": null
+}
