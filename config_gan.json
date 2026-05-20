@@ -1,0 +1,90 @@
+{
+    "_comment": "Relativistic GAN config",
+
+    "seed": 0,
+    "batch_size": 64,
+
+    "lr_g": 5e-5,
+    "lr_d": 5e-5,
+    "warmup": 50,
+
+    "d_accum": 1,
+    "g_accum": 1,
+    "max_grad_norm": 1.0,
+
+    "target_d_loss": 0.693147,
+
+    "_comment_augmentation": "Set noise_ema_decay=0.0 + replay_buffer_size=0 to degenerate into a plain GAN (no noise augmentation, no replay).",
+    "noise_ema_decay": 0,
+
+    "replay_buffer_size": 0,
+    "replay_buffer_prob": 0.5,
+
+    "eval_interval": 50,
+    "save_every_n_steps": 2000,
+    "log_every_n_steps": 10,
+    "preview_samples_per_gpu": 4,
+    "preview_quality": 100,
+
+    "ckpt_path": "experiments/gan-run/ckpts",
+    "preview_path": "experiments/gan-run/previews",
+
+    "resume_checkpoint": null,
+
+    "g_model_config": {
+        "input_dim": 768,
+        "output_dim": 768,
+        "dim": 768,
+        "num_layers": 12,
+        "num_heads": 12,
+        "exp_fac": 4,
+        "rope_seq_length": 10000,
+        "n_register_tokens": 8,
+        "use_text_embed": true,
+        "text_vocab_size": 32000,
+        "patch_size": 16,
+        "compile_blocks": true
+    },
+
+    "d_model_config": {
+        "input_dim": 768,
+        "dim": 768,
+        "num_layers": 12,
+        "num_heads": 12,
+        "exp_fac": 4,
+        "rope_seq_length": 10000,
+        "n_register_tokens": 8,
+        "use_text_embed": true,
+        "text_vocab_size": 32000,
+        "class_count": 1000,
+        "disc_embed_dim": 256,
+        "proj_norm": "batchnorm",
+        "patch_size": 16,
+        "compile_blocks": true
+    },
+
+    "parquet_dataloader": {
+        "parquet_sources": {
+            "my_dataset": {
+                "path": "/home/teflocarbon/datapool_ssd/radiance/flow/overfit_parquet/part-0.parquet",
+                "n_samples": null
+            }
+        },
+        "caption_columns": {
+            "tags": {"weight": 1.0, "is_tag_based": true}
+        },
+        "filename_column": "url",
+        "width_column": "image_width",
+        "height_column": "image_height",
+        "loss_weight_column": null,
+        "image_folder_path": "",
+        "base_resolution": [256],
+        "shuffle_tags": false,
+        "tag_drop_percentage": 0.0,
+        "ratio_cutoff": 2.0,
+        "resolution_step": 64,
+        "num_workers": 50,
+        "prefetch_factor": 8,
+        "offset": 0
+    }
+}
