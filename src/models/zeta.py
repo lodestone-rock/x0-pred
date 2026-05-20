@@ -33,6 +33,8 @@ from einops import rearrange
 from torch import Tensor
 from tqdm import tqdm
 
+from src.models.flow import create_distribution
+
 
 # ---------------------------------------------------------------------------
 # Patch helpers (from utils.py)
@@ -837,7 +839,8 @@ class ZImageDCT(nn.Module):
         txt_mask: Tensor,
         neg_txt: Tensor,
         neg_txt_mask: Tensor,
-        schedule_shift: bool = True,
+        schedule_mu: float | None = None,
+        grid_points: int = 1024,
         return_intermediates: bool = False,
     ) -> tuple[Tensor, list | None]:
         """Euler CFG sampler stepping from t=1 (noise) to t=0 (clean).
@@ -848,25 +851,55 @@ class ZImageDCT(nn.Module):
             num_steps:          Number of Euler steps.
             txt / txt_mask:     Positive text conditioning.
             neg_txt / neg_txt_mask: Negative text conditioning.
-            schedule_shift:     Apply sequence-length-based timestep shift.
+            schedule_mu:        Timestep shift strength (same as flow_baseline).
+                                  None  → sequence-length auto-mu via get_schedule.
+                                  0.0   → uniform linear schedule (no shift).
+                                  float → shifted via create_distribution(mu=value).
+            grid_points:        CDF grid resolution for schedule_mu path.
             return_intermediates: If True, return list of CPU tensors at each step.
 
         Returns:
             (denoised_image, trajectories_or_None)
         """
         B, C, H, W = x.shape
-        num_patches = (H // self.patch_size) * (W // self.patch_size)
+        # Use spatial_patch_size (e.g. 32) for the sequence-length-aware schedule,
+        # not self.patch_size (which is 1, the internal decoder token size).
+        num_patches = (H // self.spatial_patch_size) * (W // self.spatial_patch_size)
 
-        timesteps = get_schedule(num_steps, num_patches, shift=schedule_shift)
+        # Build timestep schedule — identical logic to flow_baseline.euler_cfg.
+        if schedule_mu is None:
+            # Auto-mu from sequence length (original ZImage behaviour).
+            t_seq = torch.tensor(
+                get_schedule(num_steps, num_patches, shift=True),
+                device=x.device, dtype=x.dtype,
+            )
+        elif schedule_mu == 0.0:
+            # Uniform linear, no shift.
+            t_seq = torch.linspace(1.0, 0.0, num_steps + 1, device=x.device, dtype=x.dtype)
+        else:
+            # Shifted via create_distribution CDF inversion.
+            grid_t, grid_p = create_distribution(grid_points, device=x.device, mu=schedule_mu)
+            grid_t = grid_t.to(x.dtype)
+            grid_p = grid_p.to(x.dtype)
+
+            cdf = torch.cumsum(grid_p, dim=0)
+            cdf = cdf / cdf[-1].clamp(min=1e-8)
+
+            q   = torch.linspace(1.0, 0.0, num_steps + 1, device=x.device, dtype=x.dtype)
+            idx = torch.searchsorted(cdf, q.clamp(0.0, 1.0)).clamp(1, grid_points - 1)
+            cdf_lo, cdf_hi = cdf[idx - 1], cdf[idx]
+            t_lo,   t_hi   = grid_t[idx - 1], grid_t[idx]
+            frac  = (q - cdf_lo) / (cdf_hi - cdf_lo).clamp(min=1e-8)
+            t_seq = t_lo + frac * (t_hi - t_lo)
+            t_seq[0]  = 1.0
+            t_seq[-1] = 0.0
 
         trajectories = [x.cpu()] if return_intermediates else None
 
-        for t_curr, t_prev in tqdm(
-            zip(timesteps[:-1], timesteps[1:]),
-            total=num_steps,
-            desc="Euler CFG",
-        ):
-            t_vec = torch.full((B,), t_curr, dtype=x.dtype, device=x.device)
+        for i in tqdm(range(num_steps), desc="Euler CFG"):
+            t_curr = t_seq[i]
+            t_prev = t_seq[i + 1]
+            t_vec  = torch.full((B,), t_curr.item(), dtype=x.dtype, device=x.device)
 
             v_pos = self.forward(x, t_vec, txt,     txt_mask)
             v_neg = self.forward(x, t_vec, neg_txt, neg_txt_mask)

@@ -27,7 +27,7 @@ from contextlib import nullcontext
 
 import torch
 import torch.nn.functional as F
-from torch.optim import AdamW
+from ramtorch import AdamW
 from torch.optim.lr_scheduler import LinearLR
 from torch.profiler import ProfilerActivity, profile, record_function, schedule
 from torch.utils.data import DataLoader
@@ -259,10 +259,11 @@ def backward_fn(
     device   = predicted_image.device
     t_scalar = t.view(-1)
 
-    # Identical loss to pixel_space_transformers.py:
-    # model predicts x0, we convert both target and prediction to v-space and take MSE.
-    target_velocity    = (noisy_image - x1)              / (t + 5e-2)
-    predicted_velocity = (noisy_image - predicted_image) / (t + 5e-2)
+    # ZImageDCT.forward() already returns v-prediction internally via
+    # _apply_x0_residual — so predicted_image IS the velocity, don't re-derive it.
+    # Target v = (noisy - x1) / (t + eps), same formula as pixel_space_transformers.py.
+    target_velocity    = (noisy_image - x1) / (t + 5e-2)
+    predicted_velocity = predicted_image
 
     if t_weights is not None:
         per_sample_mse = F.mse_loss(predicted_velocity, target_velocity,
@@ -300,14 +301,14 @@ def preview_fn(
     text_encoders: list,   # one per GPU; indexed by gpu_id
     tokenizer,
     max_seq_len: int,
-    schedule_shift: bool = True,
+    schedule_mu: float | None = None,
 ) -> torch.Tensor:
     """Run euler_cfg for every combo on one GPU.
 
     Each entry in ``inference_cfg_and_steps`` may have 2 or 3 elements::
 
         [cfg_scale, steps]
-        [cfg_scale, steps, schedule_shift_override]   # bool
+        [cfg_scale, steps, schedule_mu]   # float override, or null for auto
 
     Returns a float32 CPU tensor [(n_combos+1) * n_samples, C, H, W] in
     [-1, 1], with real samples appended as the last n_samples rows.
@@ -331,11 +332,11 @@ def preview_fn(
         for combo in inference_cfg_and_steps:
             if len(combo) == 2:
                 cfg_scale, steps = combo
-                shift = schedule_shift
+                mu = schedule_mu
             elif len(combo) == 3:
-                cfg_scale, steps, shift = combo
-                if shift is None:
-                    shift = schedule_shift
+                cfg_scale, steps, mu = combo
+                if mu is None:
+                    mu = schedule_mu
             else:
                 raise ValueError(
                     f"inference_cfg_and_steps entry must have 2–3 elements, got {combo!r}"
@@ -349,7 +350,7 @@ def preview_fn(
                 txt_mask=pos_mask,
                 neg_txt=neg_embeds,
                 neg_txt_mask=neg_mask,
-                schedule_shift=shift,
+                schedule_mu=mu,
             )
             fake_rows.append(fake.clamp(-1, 1).cpu().float())
 
@@ -382,10 +383,10 @@ def train(cfg: dict):
 
     if qwen_path and _TRANSFORMERS_AVAILABLE:
         print(f"Loading Qwen3 tokenizer from: {qwen_path}")
-        tokenizer = AutoTokenizer.from_pretrained(qwen_path)
+        tokenizer = AutoTokenizer.from_pretrained(qwen_path, subfolder="tokenizer")
 
         print(f"Loading Qwen3 text encoder on {n_gpus} GPU(s)...")
-        base_enc = Qwen3ForCausalLM.from_pretrained(qwen_path, torch_dtype=torch.bfloat16)
+        base_enc = Qwen3ForCausalLM.from_pretrained(qwen_path, subfolder="text_encoder", torch_dtype=torch.bfloat16)
         for gpu_id in range(n_gpus):
             enc = copy.deepcopy(base_enc).to(f"cuda:{gpu_id}").eval()
             for p in enc.parameters():
@@ -485,7 +486,7 @@ def train(cfg: dict):
     wrapper = MultiGPUWrapper(
         model_factory=model_factory,
         optimizer_factory=lambda params: AdamW(
-            params, lr=cfg["lr"], weight_decay=1e-4, betas=(0.9, 0.95)
+            params, lr=cfg["lr"], weight_decay=1e-4, betas=(0.9, 0.95), dtype=torch.float32
         ),
         gradient_accumulation_steps=cfg["accum"],
         max_grad_norm=1.0,
@@ -538,7 +539,6 @@ def train(cfg: dict):
     t_mu_end          = cfg.get("t_mu_end", 1.0)
     t_mu_anneal_steps = cfg.get("t_mu_anneal_steps", 0)
     t_shift_mode      = cfg.get("t_shift_mode", "sampled")
-    schedule_shift    = cfg.get("schedule_shift", True)
 
     master_seed = cfg.get("seed", 42)
     torch.manual_seed(master_seed)
@@ -655,7 +655,7 @@ def train(cfg: dict):
                         text_encoders=text_encoders,
                         tokenizer=tokenizer,
                         max_seq_len=max_seq_len,
-                        schedule_shift=schedule_shift,
+                        schedule_mu=t_mu,  # default: match training density; per-combo overrides deviate
                     )
 
                     all_images = torch.cat(preview_results, dim=0)
