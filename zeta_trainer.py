@@ -381,12 +381,15 @@ def train(cfg: dict):
     text_encoders = []
     tokenizer     = None
 
+    # Accept both key names; qwen_tokenizer_path takes precedence over tokenizer_path
+    tokenizer_path = cfg.get("qwen_tokenizer_path") or cfg.get("tokenizer_path") or qwen_path
+
     if qwen_path and _TRANSFORMERS_AVAILABLE:
-        print(f"Loading Qwen3 tokenizer from: {qwen_path}")
-        tokenizer = AutoTokenizer.from_pretrained(qwen_path, subfolder="tokenizer")
+        print(f"Loading Qwen3 tokenizer from: {tokenizer_path}")
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
 
         print(f"Loading Qwen3 text encoder on {n_gpus} GPU(s)...")
-        base_enc = Qwen3ForCausalLM.from_pretrained(qwen_path, subfolder="text_encoder", torch_dtype=torch.bfloat16)
+        base_enc = Qwen3ForCausalLM.from_pretrained(qwen_path, torch_dtype=torch.bfloat16)
         for gpu_id in range(n_gpus):
             enc = copy.deepcopy(base_enc).to(f"cuda:{gpu_id}").eval()
             for p in enc.parameters():

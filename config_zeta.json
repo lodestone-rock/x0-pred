@@ -8,7 +8,6 @@
     "t_mu_end": 1.0,
     "t_mu_anneal_steps": 0,
     "t_shift_mode": "sampled",
-    "schedule_shift": true,
     "profile": false,
     "profile_start": 20,
     "profile_stop": 23,
@@ -23,6 +22,7 @@
     "uncond_ratio": 0.1,
     "max_seq_len": 512,
     "qwen_path": "models/qwen3",
+    "tokenizer_path": "models/qwen3",
     "preview_path": "zeta-run/previews",
     "ckpt_path": "zeta-run/ckpts",
     "model_config": {
@@ -80,10 +80,10 @@
         "offset": 0
     },
     "inference_cfg_and_steps": [
-        [1, 1],
-        [1, 28],
-        [4, 28],
-        [4, 28, false]
+        [1,  1,  null],
+        [1,  28, null],
+        [4,  28, null],
+        [4,  28, 2.0]
     ],
     "model_checkpoint": null
 }
