@@ -33,12 +33,18 @@ from torch.utils.data import DataLoader
 from torchvision.io import write_jpeg
 from torchvision.utils import make_grid, save_image
 from tqdm import tqdm
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    _PIL_AVAILABLE = True
+except ImportError:
+    _PIL_AVAILABLE = False
 
 from ramtorch.multi_gpu import MultiGPUWrapper
 
 from src.models.radiance import Radiance, RadianceParams
 from src.models.flow import compute_timestep_weights, create_distribution, sample_from_distribution
 from src.dataloaders.parquet_dataloader import ParquetTextImageDataset
+from src.dataloaders.bucketing_logic import _bucket_generator
 
 torch.manual_seed(0)
 
@@ -344,6 +350,61 @@ def preview_fn(
 
 
 # ---------------------------------------------------------------------------
+# Compile warmup
+# ---------------------------------------------------------------------------
+
+
+def warmup_compiled_model(
+    models: list,
+    model_cfg: dict,
+    base_res: list,
+    ratio_cutoff: float,
+    resolution_step: int,
+    max_seq_len: int,
+) -> None:
+    """Eagerly trigger torch.compile for every resolution bucket.
+
+    torch.compile is lazy — Dynamo only traces on the first forward call for
+    each unique input shape.  When the training loop dispatches work via a
+    ThreadPoolExecutor, two threads can hit their first-compilation at the
+    same time, causing the intermittent
+    "FX tracing a dynamo-optimized function" error.
+
+    Calling this *after* compile_blocks() but *before* the DataLoader is
+    constructed runs all compilations sequentially on a single thread, so
+    the executor never sees a cold cache.
+    """
+    in_channels    = model_cfg.get("in_channels", 3)
+    context_in_dim = model_cfg.get("context_in_dim", 4096)
+
+    image_shapes: set[tuple[int, int]] = set()
+    for res in base_res:
+        for w, h in _bucket_generator(res, ratio_cutoff, resolution_step):
+            image_shapes.add((h, w))
+
+    n_buckets = len(image_shapes)
+    n_gpus    = len(models)
+    print(f"  Warming up {n_buckets} resolution bucket(s) on {n_gpus} GPU(s)...")
+
+    for gpu_id, model in enumerate(models):
+        device = f"cuda:{gpu_id}"
+        model.eval()
+        with torch.no_grad(), torch.autocast("cuda", torch.bfloat16):
+            for H, W in sorted(image_shapes):
+                dummy_img = torch.zeros(1, in_channels, H, W, device=device)
+                dummy_t   = torch.tensor([0.5], device=device)
+                dummy_txt = torch.zeros(1, max_seq_len, context_in_dim, device=device)
+                dummy_msk = torch.ones(1, max_seq_len, dtype=torch.bool, device=device)
+                model(dummy_img, dummy_t, dummy_txt, dummy_msk)
+                num_patches = (H // 16) * (W // 16)
+                print(f"    [GPU {gpu_id}] {W}x{H} ({num_patches} patches)")
+        torch.cuda.synchronize(device)
+        model.train()
+
+    print("  Warmup complete.")
+
+
+# ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
 
@@ -473,7 +534,7 @@ def train(cfg: dict):
     wrapper = MultiGPUWrapper(
         model_factory=model_factory,
         optimizer_factory=lambda params: AdamW(
-            params, lr=cfg["lr"], weight_decay=1e-4, betas=(0.9, 0.95), dtype=torch.float32
+            params, lr=cfg["lr"], weight_decay=1e-4, betas=(0.9, 0.95)
         ),
         gradient_accumulation_steps=cfg["accum"],
         max_grad_norm=1.0,
@@ -506,6 +567,14 @@ def train(cfg: dict):
         print(f"Compiling transformer blocks on {n_gpus} GPU(s)...")
         for m in wrapper.models:
             m.compile_blocks()
+        warmup_compiled_model(
+            wrapper.models,
+            cfg["model_config"],
+            parquet_cfg.get("base_resolution", [256]),
+            parquet_cfg.get("ratio_cutoff", 2.0),
+            parquet_cfg.get("resolution_step", 64),
+            max_seq_len,
+        )
         print("  Done.")
 
     # ------------------------------------------------------------------
@@ -645,14 +714,93 @@ def train(cfg: dict):
                         schedule_mu=t_mu,
                     )
 
-                    all_images = torch.cat(preview_results, dim=0)
-                    img_path   = f"{cfg['preview_path']}/step_{global_step}.{ext}"
-                    grid       = make_grid((all_images + 1) / 2, nrow=preview_spg)
-                    if use_png:
-                        save_image(grid, img_path)
+                    # Reorder GPU-major → combo-major so each combo occupies
+                    # one contiguous grid row:
+                    #   cat shape: [n_gpus*(n_combos+1)*spg, C, H, W]
+                    #   -> [n_gpus, n_combos+1, spg, C, H, W]
+                    #   -> [n_combos+1, n_gpus, spg, C, H, W]
+                    #   -> [(n_combos+1)*n_gpus*spg, C, H, W]
+                    n_combos = len(cfg["inference_cfg_and_steps"])
+                    _C, _H, _W = preview_results[0].shape[1:]
+                    all_images = (
+                        torch.cat(preview_results, dim=0)
+                        .view(n_gpus, n_combos + 1, preview_spg, _C, _H, _W)
+                        .permute(1, 0, 2, 3, 4, 5)
+                        .reshape((n_combos + 1) * n_gpus * preview_spg, _C, _H, _W)
+                    )
+                    total_cols = preview_spg * n_gpus
+                    img_path = f"{cfg['preview_path']}/step_{global_step}.{ext}"
+                    grid = make_grid((all_images + 1) / 2, nrow=total_cols)
+
+                    # --- Row-axis labels (cfg / steps / shift / ground truth) ---
+                    if _PIL_AVAILABLE:
+                        _row_labels = []
+                        for _combo in cfg["inference_cfg_and_steps"]:
+                            _cfg_s = _combo[0]
+                            _steps = _combo[1]
+                            _mu    = _combo[2] if len(_combo) > 2 else None
+                            _shift = "null" if _mu is None else str(_mu)
+                            _row_labels.append(f"cfg {_cfg_s}  steps {_steps}  shift {_shift}")
+                        _row_labels.append("ground truth")
+
+                        _grid_np  = (grid.clamp(0, 1) * 255).to(torch.uint8).permute(1, 2, 0).numpy()
+                        _grid_pil = Image.fromarray(_grid_np, mode="RGB")
+                        _gw, _gh  = _grid_pil.size
+
+                        _n_rows  = n_combos + 1
+                        _row_h   = _gh // _n_rows
+                        _font_size = 12
+
+                        _font = None
+                        for _fp in [
+                            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+                        ]:
+                            try:
+                                _font = ImageFont.truetype(_fp, _font_size)
+                                break
+                            except Exception:
+                                pass
+                        if _font is None:
+                            _font = ImageFont.load_default()
+
+                        _draw_tmp = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+                        _label_h  = max(
+                            _draw_tmp.textbbox((0, 0), lbl, font=_font)[3]
+                            for lbl in _row_labels
+                        )
+                        _label_w = _label_h + 8
+
+                        _strip = Image.new("RGB", (_label_w, _gh), (30, 30, 30))
+                        for _i, _lbl in enumerate(_row_labels):
+                            _bb  = _draw_tmp.textbbox((0, 0), _lbl, font=_font)
+                            _tw  = _bb[2] - _bb[0]
+                            _th  = _bb[3] - _bb[1]
+                            _tile = Image.new("RGB", (_row_h, _label_w), (30, 30, 30))
+                            ImageDraw.Draw(_tile).text(
+                                (_row_h // 2 - _tw // 2, _label_w // 2 - _th // 2),
+                                _lbl, fill=(220, 220, 220), font=_font,
+                            )
+                            _strip.paste(_tile.rotate(90, expand=True), (0, _i * _row_h))
+
+                        _composite = Image.new("RGB", (_label_w + _gw, _gh), (0, 0, 0))
+                        _composite.paste(_strip, (0, 0))
+                        _composite.paste(_grid_pil, (_label_w, 0))
+
+                        if use_png:
+                            _composite.save(img_path)
+                        else:
+                            import io as _io
+                            _buf = _io.BytesIO()
+                            _composite.save(_buf, format="JPEG", quality=preview_qual)
+                            with open(img_path, "wb") as _f:
+                                _f.write(_buf.getvalue())
                     else:
-                        grid_uint8 = (grid.clamp(0, 1) * 255).to(torch.uint8)
-                        write_jpeg(grid_uint8, img_path, quality=preview_qual)
+                        if use_png:
+                            save_image(grid, img_path)
+                        else:
+                            grid_uint8 = (grid.clamp(0, 1) * 255).to(torch.uint8)
+                            write_jpeg(grid_uint8, img_path, quality=preview_qual)
 
                 global_step += 1
 
