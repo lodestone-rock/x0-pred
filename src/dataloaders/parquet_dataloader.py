@@ -24,6 +24,8 @@ Example config snippet:
     "height_column":      "image_height",
     "loss_weight_column": null,          // or e.g. "sampling_probability"
     "image_folder_path":  "",            // base dir for local files; ignored for URLs
+    "base_res":           [512, 1024],   // multiple base resolutions
+    "base_res_weights":   [0.25, 0.75], // optional: weighted sampling; omit for uniform
     ...
 }
 """
@@ -293,17 +295,31 @@ def _build_standardized_buckets(base_resolution: list[int], ratio_cutoff: float,
     return standardized_buckets
 
 
-def _assign_bucket(image_width: int, image_height: int,
-                   standardized_buckets: dict, ratio_cutoff: float,
-                   rng: random.Random) -> tuple | None:
-    """Return a randomly chosen bucket (w, h) for the given image dimensions, or None if filtered."""
+def _assign_bucket(
+    image_width: int,
+    image_height: int,
+    standardized_buckets: dict,
+    ratio_cutoff: float,
+    rng: random.Random,
+    weights: list[float] | None = None,
+) -> tuple | None:
+    """Return a randomly chosen bucket (w, h) for the given image dimensions, or None if filtered.
+
+    Parameters
+    ----------
+    weights :
+        Sampling probabilities for each entry in ``standardized_buckets``
+        (must match its length).  ``None`` → uniform selection (original
+        behaviour, preserved for backward compatibility).
+    """
     if image_width <= 0 or image_height <= 0:
         return None
     aspect_ratio = image_width / image_height
     if not (1.0 / ratio_cutoff < aspect_ratio < ratio_cutoff):
         return None
     w, h = _normalize_width_height(image_width, image_height)
-    chosen_std = rng.choice(list(standardized_buckets.values()))
+    bucket_list = list(standardized_buckets.values())
+    chosen_std = rng.choices(bucket_list, weights=weights, k=1)[0]
     return _closest_bucket(w, h, chosen_std)
 
 
@@ -336,6 +352,13 @@ class ParquetTextImageDataset(Dataset):
         Base directory prepended to local filenames. Ignored for URLs.
     base_res : list[int]
         Base resolutions for bucket generation.
+    base_res_weights : list[float] | None
+        Optional sampling weights for each entry in ``base_res``.  When
+        provided, buckets from ``base_res[i]`` are chosen with probability
+        proportional to ``base_res_weights[i]``; otherwise every resolution
+        is equally likely (original behaviour).  Raw positive values are
+        accepted — they are normalised internally, so ``[1, 3]`` and
+        ``[0.25, 0.75]`` are equivalent.
     ratio_cutoff : float
         Maximum aspect ratio (images outside ``[1/r, r]`` are dropped).
     resolution_step : int
@@ -383,6 +406,7 @@ class ParquetTextImageDataset(Dataset):
         loss_weight_column: str | None = None,
         image_folder_path: str = "",
         base_res: list[int] = None,
+        base_res_weights: list[float] | None = None,
         ratio_cutoff: float = 2.0,
         resolution_step: int = 64,
         shuffle_tags: bool = True,
@@ -403,6 +427,20 @@ class ParquetTextImageDataset(Dataset):
         if base_res is None:
             base_res = [1024]
 
+        # Validate and normalise base_res_weights
+        if base_res_weights is not None:
+            if len(base_res_weights) != len(base_res):
+                raise ValueError(
+                    f"base_res_weights length ({len(base_res_weights)}) must match "
+                    f"base_res length ({len(base_res)})"
+                )
+            if any(w < 0 for w in base_res_weights):
+                raise ValueError("All base_res_weights must be non-negative")
+            total_res_w = sum(base_res_weights)
+            if total_res_w <= 0:
+                raise ValueError("base_res_weights must sum to a positive value")
+            base_res_weights = [w / total_res_w for w in base_res_weights]
+
         assert batch_size % num_gpus == 0, "batch_size must be divisible by num_gpus"
 
         self.batch_size = batch_size
@@ -414,6 +452,7 @@ class ParquetTextImageDataset(Dataset):
         self.loss_weight_column = loss_weight_column
         self.image_folder_path = image_folder_path
         self.base_res = base_res
+        self.base_res_weights = base_res_weights
         self.ratio_cutoff = ratio_cutoff
         self.resolution_step = resolution_step
         self.shuffle_tags = shuffle_tags
@@ -533,7 +572,8 @@ class ParquetTextImageDataset(Dataset):
                 skipped += 1
                 continue
 
-            bucket = _assign_bucket(w, h, standardized_buckets, self.ratio_cutoff, rng)
+            bucket = _assign_bucket(w, h, standardized_buckets, self.ratio_cutoff, rng,
+                                     weights=self.base_res_weights)
             if bucket is None:
                 skipped += 1
                 continue

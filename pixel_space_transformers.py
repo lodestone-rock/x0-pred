@@ -630,6 +630,7 @@ def train(cfg: dict):
         loss_weight_column=parquet_cfg.get("loss_weight_column", None),
         image_folder_path=parquet_cfg.get("image_folder_path", ""),
         base_res=parquet_cfg.get("base_resolution", [256]),
+        base_res_weights=parquet_cfg.get("base_resolution_weights", None),
         ratio_cutoff=parquet_cfg.get("ratio_cutoff", 2.0),
         resolution_step=parquet_cfg.get("resolution_step", 64),
         shuffle_tags=parquet_cfg.get("shuffle_tags", True),
