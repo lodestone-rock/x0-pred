@@ -1026,3 +1026,330 @@ class ParquetTextImageDataset(Dataset):
             return images, captions_out, index, loss_weighting, reference_images_batch
 
         return images, captions_out, index, loss_weighting
+
+
+# ---------------------------------------------------------------------------
+# Optimal-Transport dataloader
+# ---------------------------------------------------------------------------
+
+class OTParquetTextImageDataset(ParquetTextImageDataset):
+    """Subclass of :class:`ParquetTextImageDataset` that pre-computes optimal-
+    transport (OT) noise–image assignments per resolution bucket and caches
+    the results as parquet files so they survive trainer restarts.
+
+    For each bucket ``(W, H)`` the following happens once per epoch:
+
+    1. All N images in the bucket are loaded and flattened to ``[N, C·W·H]``
+       float32 on GPU.
+    2. N Gaussian noise samples are generated **on GPU** using
+       ``torch.Generator`` seeded with per-sample int64 seeds (so the exact
+       same noise can be reconstructed deterministically during training).
+    3. A pairwise squared-L2 cost matrix ``D[N, N]`` is computed on GPU in
+       row-tiles to avoid OOM, then copied to CPU as a numpy array.
+    4. ``scipy.optimize.linear_sum_assignment`` solves the assignment problem
+       (Hungarian algorithm, O(N³) — keep N ≤ 32 000).
+    5. The resulting ``filename → ot_seed`` mapping is written to
+       ``{ot_cache_dir}/{W}x{H}.parquet``.  On subsequent runs of the same
+       epoch the cache is read back instead of recomputing.
+    6. At the end of each epoch (``resample()``), all cache files are deleted
+       and fresh OT is computed for the new sampled subset.
+
+    Each ``__getitem__`` call appends a 5th element ``ot_seeds`` — a
+    ``[rank_batch_size]`` int64 CPU tensor — to the normal 4-tuple.  The
+    training loop should pass these seeds to ``forward_fn`` so noise ``x0``
+    is regenerated with ``torch.Generator(device).manual_seed(seed)``.
+
+    .. warning::
+        The full squared-L2 cost matrix is ``N × N × 4 bytes`` in RAM.
+        At N = 32 000 that is ≈ 4 GB.  Additionally, loading all N images
+        (e.g. 32 000 × 3 × 1024 × 1024 × 4 bytes ≈ 400 GB) may exceed
+        available memory for large buckets at high resolution.  This loader
+        is intended for small fine-tuning sets (≲ 100 K total images,
+        ≲ 32 K per bucket).
+
+    Parameters
+    ----------
+    ot_cache_dir : str
+        Directory where per-bucket OT cache parquets are written.
+        Created automatically if it does not exist.
+    ot_tile_size : int
+        Number of image rows to process per GPU tile when building the cost
+        matrix.  Decrease if you hit GPU OOM; increase for throughput.
+        Default: ``512``.
+    ot_warn_threshold : int
+        Emit a :mod:`warnings` warning when a bucket exceeds this many
+        samples.  Default: ``32_000``.
+    All other parameters are forwarded to :class:`ParquetTextImageDataset`.
+    """
+
+    _OT_WARN_THRESHOLD = 32_000
+
+    def __init__(
+        self,
+        *args,
+        ot_cache_dir: str,
+        ot_tile_size: int = 512,
+        ot_warn_threshold: int = _OT_WARN_THRESHOLD,
+        **kwargs,
+    ):
+        self._ot_cache_dir      = ot_cache_dir
+        self._ot_tile_size      = ot_tile_size
+        self._ot_warn_threshold = ot_warn_threshold
+        os.makedirs(ot_cache_dir, exist_ok=True)
+        # Parent __init__ calls _load_batches() → our override runs OT.
+        super().__init__(*args, **kwargs)
+
+    # ------------------------------------------------------------------
+    # Cache helpers
+    # ------------------------------------------------------------------
+
+    def _cache_path(self, bucket: tuple) -> str:
+        W, H = bucket
+        return os.path.join(self._ot_cache_dir, f"{W}x{H}.parquet")
+
+    def _load_ot_cache(self, bucket: tuple, filenames: list[str]) -> "dict | None":
+        """Return ``{filename: ot_seed}`` from the on-disk cache if valid.
+
+        Returns ``None`` when the cache is absent or does not cover every
+        filename in *filenames* (triggers full recomputation).
+        """
+        path = self._cache_path(bucket)
+        if not os.path.exists(path):
+            return None
+        try:
+            tbl = pq.read_table(path, columns=["filename", "ot_seed"])
+            cached = dict(zip(
+                tbl.column("filename").to_pylist(),
+                tbl.column("ot_seed").to_pylist(),
+            ))
+        except Exception as exc:
+            log.warning(f"[OT] Failed to read cache {path}: {exc} — recomputing.")
+            return None
+
+        # Staleness check: every filename in this epoch's bucket must be present
+        if any(fn not in cached for fn in filenames):
+            log.info(f"[OT] Cache stale for bucket {bucket} — recomputing.")
+            return None
+
+        log.info(f"[OT] Loaded OT cache for bucket {bucket} ({len(filenames)} samples).")
+        return cached
+
+    def _save_ot_cache(self, bucket: tuple, fn_to_seed: dict) -> None:
+        """Persist *fn_to_seed* mapping as a two-column parquet file."""
+        path = self._cache_path(bucket)
+        tbl = pa.table({
+            "filename": pa.array(list(fn_to_seed.keys()), type=pa.string()),
+            "ot_seed":  pa.array(list(fn_to_seed.values()), type=pa.int64()),
+        })
+        pq.write_table(tbl, path, compression="snappy")
+        log.info(f"[OT] Saved OT cache → {path}")
+
+    # ------------------------------------------------------------------
+    # Noise generation (GPU, torch — must match forward_fn)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _make_noise_gpu(seeds: list, D: int, device: str) -> torch.Tensor:
+        """Generate ``[N, D]`` float32 noise on *device* using per-row seeds.
+
+        Each row is generated with an independent ``torch.Generator`` so the
+        same seed passed to ``forward_fn`` reproduces the identical noise
+        vector at training time.
+        """
+        rows = []
+        for s in seeds:
+            gen = torch.Generator(device=device)
+            gen.manual_seed(int(s))
+            rows.append(torch.randn(D, generator=gen, device=device, dtype=torch.float32))
+        return torch.stack(rows, dim=0)  # [N, D]
+
+    # ------------------------------------------------------------------
+    # Cost-matrix computation (tiled, GPU → CPU numpy)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _squared_l2_tiled(
+        A: torch.Tensor,   # [Na, D]  — images
+        B: torch.Tensor,   # [Nb, D]  — noise
+        tile_size: int,
+    ) -> "np.ndarray":
+        """Compute squared-L2 distance matrix ``cost[i,j] = ||A_i - B_j||²``
+        in row-tiles on GPU, accumulating results into a ``[Na, Nb]`` CPU
+        numpy array.
+
+        Uses the identity  ``||a-b||² = ||a||² + ||b||² - 2·aᵀb``  so each
+        tile only needs one matmul rather than an explicit broadcast subtraction.
+        """
+        Na, Nb = A.shape[0], B.shape[0]
+        cost = np.empty((Na, Nb), dtype=np.float32)
+
+        A_sq = (A * A).sum(dim=1)   # [Na]
+        B_sq = (B * B).sum(dim=1)   # [Nb]
+
+        for row_start in range(0, Na, tile_size):
+            row_end       = min(row_start + tile_size, Na)
+            A_tile        = A[row_start:row_end]        # [T, D]
+            A_sq_tile     = A_sq[row_start:row_end]     # [T]
+
+            # [T, Nb] = [T,1] + [1,Nb] - 2·[T,D]@[D,Nb]
+            tile_cost = (
+                A_sq_tile.unsqueeze(1)
+                + B_sq.unsqueeze(0)
+                - 2.0 * (A_tile @ B.t())
+            ).clamp(min=0.0)   # guard against tiny negatives from fp rounding
+
+            cost[row_start:row_end] = tile_cost.cpu().numpy()
+
+        return cost  # [Na, Nb] float32
+
+    # ------------------------------------------------------------------
+    # Per-bucket OT
+    # ------------------------------------------------------------------
+
+    def _compute_ot_for_bucket(
+        self,
+        samples: list,
+        bucket: tuple,
+    ) -> dict:
+        """Compute OT assignment for all *samples* in *bucket*.
+
+        Returns ``{filename: ot_seed}`` mapping.
+        """
+        from scipy.optimize import linear_sum_assignment
+        import time as _time
+
+        N = len(samples)
+        W, H = bucket
+        C = 3
+        D = C * W * H
+
+        if N > self._ot_warn_threshold:
+            warnings.warn(
+                f"[OT] Bucket {bucket} has {N:,} samples which exceeds the "
+                f"warning threshold of {self._ot_warn_threshold:,}.  "
+                "Hungarian assignment is O(N³) — this will be very slow.",
+                stacklevel=2,
+            )
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"[OT] Computing assignment for bucket {bucket} "
+              f"({N} samples, D={D:,}, device={device})…")
+
+        # ---- 1. Generate noise on GPU (torch.Generator — matches forward_fn) ----
+        noise_seeds = [self._rng.randint(0, 2**62) for _ in range(N)]
+        noise_mat   = self._make_noise_gpu(noise_seeds, D, device)   # [N, D]
+
+        # ---- 2. Load & flatten all images ----
+        t_load = _time.perf_counter()
+        img_rows: list = []
+        for sample in samples:
+            img = self._load_image(sample)
+            if img is None:
+                # Fallback: zero vector (penalised but won't crash)
+                img_rows.append(torch.zeros(D, device=device, dtype=torch.float32))
+                continue
+            if isinstance(img, torch.Tensor):
+                img = self._scale_and_crop_tensor(img, H, W)   # [C, H, W]
+            else:
+                img = self.scale_and_crop_long_axis(img, H, W)
+                img = self.image_transforms(img)               # [C, H, W] float32 in [-1,1]
+            img_rows.append(img.to(device=device, dtype=torch.float32).reshape(D))
+        print(f"[OT]   Images loaded in {_time.perf_counter() - t_load:.1f}s")
+
+        img_mat = torch.stack(img_rows, dim=0)   # [N, D]
+
+        # ---- 3. Tiled squared-L2 cost matrix (GPU → CPU numpy) ----
+        t_cost = _time.perf_counter()
+        cost_np = self._squared_l2_tiled(img_mat, noise_mat, self._ot_tile_size)
+        print(f"[OT]   Cost matrix built in {_time.perf_counter() - t_cost:.1f}s")
+
+        # Free GPU tensors before the CPU-heavy Hungarian step
+        del img_mat, noise_mat
+        if device == "cuda":
+            torch.cuda.empty_cache()
+
+        # ---- 4. Hungarian assignment on CPU ----
+        t_hung = _time.perf_counter()
+        _row_ind, col_ind = linear_sum_assignment(cost_np)
+        print(f"[OT]   Hungarian solved in {_time.perf_counter() - t_hung:.1f}s")
+        del cost_np
+
+        # col_ind[i] = index of the noise vector assigned to image i
+        fn_to_seed = {
+            samples[i]["filename"]: noise_seeds[col_ind[i]]
+            for i in range(N)
+        }
+        return fn_to_seed
+
+    # ------------------------------------------------------------------
+    # Override _load_batches — augments parent result with OT seeds
+    # ------------------------------------------------------------------
+
+    def _load_batches(self) -> list:
+        # 1. Run the parent's full pipeline (subsample, bucket, shuffle, pack).
+        base_batches = super()._load_batches()
+
+        # 2. Flatten back into per-bucket groups to run OT per bucket.
+        #    All samples within a batch share the same bucket (parent invariant).
+        bucket_to_samples: dict = {}
+        for batch in base_batches:
+            for sample in batch:
+                bkt = sample["bucket"]
+                bucket_to_samples.setdefault(bkt, []).append(sample)
+
+        # 3. OT per bucket: load cache or compute, then stamp ot_seed onto
+        #    each sample dict in-place.
+        for bucket, samples in bucket_to_samples.items():
+            filenames = [s["filename"] for s in samples]
+
+            fn_to_seed = self._load_ot_cache(bucket, filenames)
+            if fn_to_seed is None:
+                fn_to_seed = self._compute_ot_for_bucket(samples, bucket)
+                self._save_ot_cache(bucket, fn_to_seed)
+
+            for s in samples:
+                s["ot_seed"] = fn_to_seed[s["filename"]]
+
+        # base_batches' sample dicts are mutated in-place — return as-is.
+        return base_batches
+
+    # ------------------------------------------------------------------
+    # Override resample — invalidate cache then rebuild
+    # ------------------------------------------------------------------
+
+    def resample(self) -> None:
+        """Clear the OT cache and recompute fresh assignments for the new epoch."""
+        print(f"[OTParquetTextImageDataset] clearing OT cache in {self._ot_cache_dir}…")
+        for fname in os.listdir(self._ot_cache_dir):
+            if fname.endswith(".parquet"):
+                try:
+                    os.remove(os.path.join(self._ot_cache_dir, fname))
+                except OSError as exc:
+                    log.warning(f"[OT] Could not delete cache file {fname}: {exc}")
+        # Parent resample reloads parquets and calls _load_batches → our
+        # override kicks in and recomputes OT since the cache is now empty.
+        super().resample()
+
+    # ------------------------------------------------------------------
+    # Override __getitem__ — append ot_seeds tensor
+    # ------------------------------------------------------------------
+
+    def __getitem__(self, index: int):
+        result = super().__getitem__(index)
+
+        # Collect the ot_seed for each sample in this rank's batch slice.
+        # self.batches[index] is already the rank-sliced list of sample dicts.
+        batch = self.batches[index]
+        ot_seeds = torch.tensor(
+            [s.get("ot_seed", 0) for s in batch],
+            dtype=torch.int64,
+        )
+
+        # Insert ot_seeds as the 5th element.
+        # Parent returns either (imgs, caps, idx, lw) or (imgs, caps, idx, lw, refs).
+        if len(result) == 5:
+            # reference images present: keep them as last element
+            images, captions_out, idx, loss_weighting, ref_images = result
+            return images, captions_out, idx, loss_weighting, ot_seeds, ref_images
+        else:
+            return (*result, ot_seeds)

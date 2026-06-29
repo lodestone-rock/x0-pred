@@ -52,7 +52,7 @@ from src.models.flow import (
     compute_timestep_weights,
 )
 from src.models.flow_baseline import FlowBaseline
-from src.dataloaders.parquet_dataloader import ParquetTextImageDataset
+from src.dataloaders.parquet_dataloader import ParquetTextImageDataset, OTParquetTextImageDataset
 from src.dataloaders.bucketing_logic import _bucket_generator
 
 # Seed is set at train() entry from config; this is a fallback.
@@ -199,6 +199,7 @@ def forward_fn(
     use_mask: bool = False,
     skip_middle: bool = False,
     uncond_token_ids: "torch.Tensor | None" = None,
+    ot_seed_chunks: "list | None" = None,
 ) -> tuple:
     """Forward only — returns everything needed for backward.
     All tensors are in [B, C, H, W] image space; no patch flattening here.
@@ -218,10 +219,34 @@ def forward_fn(
         Both coin-flips are done in the training loop so all GPUs see
         the same decision. ``skip_middle`` takes precedence over
         ``use_mask`` inside ``Flow.forward``.
+        ot_seed_chunks: optional list of per-GPU ``[B]`` int64 tensors
+            produced by :class:`OTParquetTextImageDataset`.  Each GPU
+            indexes into this list via ``gpu_id``.  When provided, each
+            sample's ``x0`` is generated deterministically on *device* using
+            ``torch.Generator(device).manual_seed(seed)`` so the OT
+            assignment is preserved exactly at training time.  When ``None``
+            (default), ``x0`` is sampled i.i.d. from the global RNG as usual.
     """
     device = f"cuda:{gpu_id}"
     x1 = real.to(device, non_blocking=True)          # [B, C, H, W]
-    x0 = torch.randn_like(x1)
+
+    # Resolve per-GPU OT seeds from the shared list (indexed by gpu_id).
+    ot_seeds = ot_seed_chunks[gpu_id] if ot_seed_chunks is not None else None
+
+    if ot_seeds is not None:
+        # Regenerate each sample's noise from its OT-assigned seed so the
+        # noise–image pairing computed offline is reproduced exactly.
+        B_ot, C_ot, H_ot, W_ot = x1.shape
+        x0_rows = []
+        for i in range(B_ot):
+            gen = torch.Generator(device=device)
+            gen.manual_seed(int(ot_seeds[i].item()))
+            x0_rows.append(
+                torch.randn(C_ot, H_ot, W_ot, generator=gen, device=device, dtype=x1.dtype)
+            )
+        x0 = torch.stack(x0_rows, dim=0)             # [B, C, H, W]
+    else:
+        x0 = torch.randn_like(x1)
 
     B = x1.shape[0]
     if t_shift_mode == "weighted":
@@ -619,8 +644,12 @@ def train(cfg: dict):
             "Please add a 'parquet_dataloader' section to config.json."
         )
 
-    print("Using ParquetTextImageDataset")
-    dataset = ParquetTextImageDataset(
+    ot_cfg = parquet_cfg.get("optimal_transport", {})
+    use_ot = bool(ot_cfg.get("enabled", False))
+    dataset_cls = OTParquetTextImageDataset if use_ot else ParquetTextImageDataset
+    print(f"Using {'OTParquetTextImageDataset' if use_ot else 'ParquetTextImageDataset'}")
+
+    _dataset_kwargs = dict(
         batch_size=cfg["batch_size"] * n_gpus,
         parquet_sources=parquet_cfg["parquet_sources"],
         caption_columns=parquet_cfg["caption_columns"],
@@ -643,6 +672,12 @@ def train(cfg: dict):
         tokenizer=tokenizer,
         max_text_len=cfg.get("max_text_len", 128),
     )
+    if use_ot:
+        _dataset_kwargs["ot_cache_dir"]      = ot_cfg["cache_dir"]
+        _dataset_kwargs["ot_tile_size"]      = ot_cfg.get("tile_size", 512)
+        _dataset_kwargs["ot_warn_threshold"] = ot_cfg.get("warn_threshold", 32_000)
+
+    dataset = dataset_cls(**_dataset_kwargs)
     train_loader = DataLoader(
         dataset,
         batch_size=1,
@@ -788,6 +823,11 @@ def train(cfg: dict):
                 batch_data = batch_data[0]
                 images, captions, _idx, loss_weights = batch_data[:4]
 
+                # OT seeds are the 5th element when using OTParquetTextImageDataset.
+                # They may be absent (None) for the standard dataloader — forward_fn
+                # falls back to i.i.d. noise in that case.
+                ot_seeds = batch_data[4] if len(batch_data) > 4 and isinstance(batch_data[4], torch.Tensor) else None
+
                 # Split across GPUs
                 spg = images.shape[0] // n_gpus
                 image_chunks   = [images[i*spg:(i+1)*spg]   for i in range(n_gpus)]
@@ -797,6 +837,10 @@ def train(cfg: dict):
                     caption_chunks = [captions[i*spg:(i+1)*spg] for i in range(n_gpus)]
                 else:
                     caption_chunks = [captions[i*spg:(i+1)*spg] for i in range(n_gpus)]
+                ot_seed_chunks = (
+                    [ot_seeds[i*spg:(i+1)*spg] for i in range(n_gpus)]
+                    if ot_seeds is not None else [None] * n_gpus
+                )
 
                 # Anneal t_mu linearly from t_mu_start → t_mu_end.
                 if t_mu_anneal_steps > 0:
@@ -824,6 +868,9 @@ def train(cfg: dict):
                         use_mask=use_mask,
                         skip_middle=skip_middle,
                         uncond_token_ids=uncond_token_ids,
+                        # ot_seed_chunks is a list[Tensor|None] indexed by gpu_id;
+                        # forward_fn picks its own slice via gpu_id.
+                        ot_seed_chunks=ot_seed_chunks,
                     )
 
                 # 2. Backward — per-GPU DINO model passed explicitly
