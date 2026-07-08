@@ -182,31 +182,87 @@ def vae_encode(ae: QwenAutoencoder, pixels: torch.Tensor) -> torch.Tensor:
         return latent.to(torch.bfloat16)
 
 
+@torch.no_grad()
+def vae_decode(ae: QwenAutoencoder, latent: torch.Tensor) -> torch.Tensor:
+    """Decode a latent [B, 16, H/8, W/8] to pixels [B, 3, H, W] in [-1, 1].
+
+    Casts the input to match the AE's weight dtype (bfloat16) so there
+    is no float32/bfloat16 mismatch inside the conv layers.
+    """
+    # Determine the AE's dtype from its parameters.
+    ae_dtype = next(ae.ae.parameters()).dtype
+    with torch.autocast("cuda", ae_dtype):
+        return ae.decode(latent.to(ae_dtype))
+
+
 # ---------------------------------------------------------------------------
-# Timestep sampling with optional mu-shift (K2 convention: t ∈ [0, 1])
+# Timestep sampling — K2 resolution-aware shifted schedule (training version)
 # ---------------------------------------------------------------------------
+
+def _mu_from_seq_len(
+    seq_len: int,
+    x1: int,
+    x2: int,
+    y1: float = 0.5,
+    y2: float = 1.15,
+) -> float:
+    """Linearly interpolate mu from image-token sequence length.
+
+    Mirrors the inference formula in k2/sampling.py::timesteps():
+        slope = (y2 - y1) / (x2 - x1)
+        mu    = slope * seq_len + (y1 - slope * x1)
+
+    The relationship to BFL's shift parameter alpha (bfl.ai/research/representation-comparison)
+    is mu = ln(alpha).  BFL's study found the optimal training shift for the
+    Qwen Image VAE is alpha ≈ 4.63 (mu ≈ 1.53) and the optimal sampling shift
+    is alpha ≈ 6.93 (mu ≈ 1.94).  K2's pretraining used a resolution-aware
+    schedule with mu_y1=0.5 (alpha ≈ 1.65 @ 256px) increasing to mu_y2=1.15
+    (alpha ≈ 3.16 @ 1280px).  For fine-tuning the pretrained K2 weights, keep
+    y1/y2 at the pretrained values so timesteps stay in-distribution.  For
+    training from scratch on the Qwen VAE, set mu_override ≈ 1.53.
+
+    Args:
+        seq_len: number of image tokens in this batch (h/patch * w/patch).
+        x1, x2: sequence-length endpoints for the interpolation range
+                (typically (minres/(ae.compression*patch))^2 and the same for maxres).
+        y1, y2: mu values at x1 and x2 respectively.
+    """
+    slope = (y2 - y1) / (x2 - x1)
+    return slope * seq_len + (y1 - slope * x1)
+
 
 def sample_timesteps(
     B: int,
     device: torch.device,
-    mu: float = 0.0,
+    mu: float,
+    sigma: float = 1.0,
 ) -> torch.Tensor:
-    """Sample B timesteps from a logit-normal distribution shifted by mu.
+    """Sample B timesteps using K2's shifted logit-uniform schedule.
 
-    mu=0  → logit-normal ≈ Beta(1,1) ≈ Uniform (no shift).
-    mu>0  → mass shifted toward t=1 (more noisy steps); K2 training default.
+    This is the *exact* inverse-CDF of the inference timestep schedule from
+    k2/sampling.py, applied sample-wise for training:
+
+        u ~ Uniform(0, 1)
+        t = exp(mu) / (exp(mu) + (1/u - 1)^sigma)
+
+    With sigma=1 and mu=0 this reduces to Uniform(0,1).  mu>0 shifts mass
+    toward t=1 (noisier timesteps), matching the shifted schedule used at
+    inference for the same resolution.  Using the same formula for training
+    and inference is essential to avoid OOD timestep distributions.
+
+    Args:
+        B:      batch size.
+        device: target device.
+        mu:     timeshift parameter, computed from seq_len via _mu_from_seq_len().
+        sigma:  schedule sharpness (K2 default = 1.0).
 
     Returns: [B] float32 tensor in (0, 1).
     """
-    u = torch.rand(B, device=device)
-    # Logit-normal shift: t = sigmoid(mu + sigma * logit(u)), sigma ≈ 1.
-    if mu == 0.0:
-        return u
-    # Clamp to avoid logit singularities at 0/1.
-    u = u.clamp(1e-4, 1 - 1e-4)
-    logit_u = torch.log(u / (1 - u))
-    t = torch.sigmoid(mu + logit_u)
-    return t
+    # Clamp u away from 0/1 to avoid (1/u - 1) → inf.
+    u = torch.rand(B, device=device).clamp(1e-5, 1 - 1e-5)
+    exp_mu = math.exp(mu)
+    t = exp_mu / (exp_mu + (1.0 / u - 1.0) ** sigma)
+    return t.float()
 
 
 # ---------------------------------------------------------------------------
@@ -222,7 +278,15 @@ def forward_fn(
     aes: list,
     encoders: list,
     uncond_ratio: float,
-    t_mu: float,
+    # Resolution-aware timeshift parameters (mirror of sampling.py::timesteps()).
+    # mu_y1/mu_y2 are the mu values at the min/max resolution endpoints.
+    # Set mu_override to a fixed float to skip the resolution-aware interpolation.
+    mu_y1: float = 0.5,
+    mu_y2: float = 1.15,
+    mu_override: float | None = None,
+    mu_sigma: float = 1.0,
+    minres: int = 256,
+    maxres: int = 1280,
 ) -> tuple:
     """Encode → patchify → forward → return (v_pred_tokens, v_target_tokens, t, txtmask).
 
@@ -234,8 +298,7 @@ def forward_fn(
     """
     device = f"cuda:{gpu_id}"
     ae = aes[gpu_id]
-    # Encoder lives on GPU 0; outputs are moved to the target device below.
-    encoder = encoders[0]
+    encoder = encoders[gpu_id]
 
     # ---- Text conditioning -----------------------------------------------
     B = pixels.shape[0]
@@ -246,26 +309,41 @@ def forward_fn(
     ]
     with torch.no_grad():
         txt, txtmask = encoder(dropped)          # [B, L, 12, 2560], [B, L] bool
+        # encoder is already on this GPU; .to() is a no-op but kept for safety
         txt = txt.to(device, non_blocking=True)
         txtmask = txtmask.to(device, non_blocking=True)
 
     # ---- VAE encode -------------------------------------------------------
     x0_clean = vae_encode(ae, pixels.to(device))   # [B, 16, H/8, W/8] bf16
 
-    # ---- Noise + interpolation -------------------------------------------
+    # ---- Noise + interpolation (t sampled after patchify so seq_len is known) ---
     x0_noise = torch.randn_like(x0_clean)
-    t = sample_timesteps(B, device=device, mu=t_mu)  # [B]
-
-    # x_t = (1-t)*clean + t*noise
-    t4 = t[:, None, None, None].to(x0_clean.dtype)
-    x_t = (1.0 - t4) * x0_clean + t4 * x0_noise    # [B, 16, H/8, W/8]
 
     # ---- Patchify (K2 prepare()) -----------------------------------------
-    # prepare() patchifies img and builds position ids + combined mask.
+    # Patchify first so we know img_seq_len for resolution-aware mu computation.
     txtlen = txt.shape[1]
     patch  = dit.config.patch
 
-    x_t_tok, pos, mask = prepare(x_t, txtlen, patch, txtmask)  # tokens: [B, hw, C*p*p]
+    # We need x_t to patchify, but t isn't sampled yet — patchify x0_clean
+    # as a shape proxy, then rebuild x_t_tok after sampling t.
+    _, pos, mask = prepare(x0_clean, txtlen, patch, txtmask)
+    img_seq_len = (x0_clean.shape[2] // patch) * (x0_clean.shape[3] // patch)
+
+    # ---- Resolution-aware timestep sampling ------------------------------
+    x1_res = (minres // (ae.compression * patch)) ** 2
+    x2_res = (maxres // (ae.compression * patch)) ** 2
+    if mu_override is not None:
+        mu = mu_override
+    else:
+        mu = _mu_from_seq_len(img_seq_len, x1_res, x2_res, mu_y1, mu_y2)
+    t = sample_timesteps(B, device=device, mu=mu, sigma=mu_sigma)  # [B]
+
+    # ---- Build x_t and patchify ------------------------------------------
+    t4 = t[:, None, None, None].to(x0_clean.dtype)
+    x_t = (1.0 - t4) * x0_clean + t4 * x0_noise    # [B, 16, H/8, W/8]
+
+    x_t_tok, pos, mask = prepare(x_t, txtlen, patch, txtmask)  # [B, hw, C*p*p]
+
     v_target_tok = rearrange(
         x0_noise - x0_clean,
         "b c (h ph) (w pw) -> b (h w) (c ph pw)",
@@ -304,6 +382,7 @@ def backward_fn(
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
+@torch._dynamo.disable
 def preview_fn(
     gpu_id: int,
     dit: SingleStreamDiT,
@@ -330,7 +409,7 @@ def preview_fn(
     _, _, latent_h, latent_w = x0_ref.shape
 
     # Decode ground-truth latents for the reference row.
-    gt_pixels = ae.decode(x0_ref.to(torch.bfloat16)).clamp(-1, 1).cpu().float()
+    gt_pixels = vae_decode(ae, x0_ref).clamp(-1, 1).cpu().float()
 
     # Encode prompts (conditional + unconditional).
     prompts = list(captions[:n_samples])
@@ -371,8 +450,7 @@ def preview_fn(
         h=latent_h // patch,
         w=latent_w // patch,
     )
-    pixels_out = ae.decode(latent.to(torch.bfloat16))   # [B, 3, H, W] in [-1,1]
-    pixels_out = pixels_out.clamp(-1, 1).cpu().float()
+    pixels_out = vae_decode(ae, latent).clamp(-1, 1).cpu().float()
 
     return torch.cat([pixels_out, gt_pixels], dim=0)  # [2*n_samples, 3, H, W]
 
@@ -402,29 +480,32 @@ def train(cfg: dict):
     dit_cfg_name = cfg.get("mmdit_config", "large_wide")
 
     print("Loading VAE...")
-    # One VAE per GPU (cheap copy — buffers only).
-    aes: list[QwenAutoencoder] = []
+    # Load once on CPU, then clone to each GPU.
     base_ae = QwenAutoencoder()
     base_ae.ae = base_ae.ae.to(dtype).eval().requires_grad_(False)
+    aes: list[QwenAutoencoder] = []
     for gpu_id in range(n_gpus):
         a = copy.deepcopy(base_ae).to(f"cuda:{gpu_id}").eval()
         a.requires_grad_(False)
         aes.append(a)
     del base_ae
-    print("  VAE ready.")
+    print(f"  VAE ready on {n_gpus} GPU(s).")
 
     print("Loading text encoder (Qwen3-VL-4B)...")
-    # Encoder is large; keep one on GPU 0, run encoding there, scatter results.
+    # Load once on CPU, then clone to each GPU.
     _enc_cfg = ENCODER_CONFIGS[enc_cfg_name]
-    encoder_gpu0 = Qwen3VLConditioner(
+    base_encoder = Qwen3VLConditioner(
         version=encoder_id,
         max_length=_enc_cfg.max_length,
         select_layers=_enc_cfg.select_layers,
-    ).to("cuda:0").eval().requires_grad_(False)
-    # For multi-GPU we keep the encoder on GPU 0 and move its outputs per-GPU
-    # inside forward_fn.
-    encoders = [encoder_gpu0] + [None] * (n_gpus - 1)  # only GPU 0 has encoder
-    print("  Encoder ready.")
+    ).eval().requires_grad_(False)
+    encoders: list[Qwen3VLConditioner] = []
+    for gpu_id in range(n_gpus):
+        e = copy.deepcopy(base_encoder).to(f"cuda:{gpu_id}").eval()
+        e.requires_grad_(False)
+        encoders.append(e)
+    del base_encoder
+    print(f"  Encoder ready on {n_gpus} GPU(s).")
 
     # ------------------------------------------------------------------
     # DiT — load base weights, inject LoRA
@@ -562,7 +643,13 @@ def train(cfg: dict):
     save_every       = cfg.get("save_every_n_steps", 1000)
     log_every        = cfg.get("log_every_n_steps", 10)
     uncond_ratio     = cfg.get("uncond_ratio", 0.1)
-    t_mu             = cfg.get("t_mu", 0.0)
+    # Resolution-aware timeshift (K2 convention, mirrors sampling.py).
+    mu_y1       = cfg.get("mu_y1", 0.5)    # mu at minres
+    mu_y2       = cfg.get("mu_y2", 1.15)   # mu at maxres
+    mu_override = cfg.get("mu_override", None)  # pin a fixed mu (overrides interpolation)
+    mu_sigma    = cfg.get("mu_sigma", 1.0)
+    minres      = cfg.get("minres", 256)
+    maxres      = cfg.get("maxres", 1280)
     preview_spg      = cfg.get("preview_samples_per_gpu", 4)
     preview_cfg      = cfg.get("preview_cfg_scale", 4.5)
     preview_steps    = cfg.get("preview_steps", 28)
@@ -577,7 +664,7 @@ def train(cfg: dict):
     csv_file   = open(csv_path, "a", newline="")
     csv_writer = csv.writer(csv_file)
     if os.path.getsize(csv_path) == 0:
-        csv_writer.writerow(["step", "loss", "lr", "t_mu", "time"])
+        csv_writer.writerow(["step", "loss", "lr", "time"])
     t0 = time.time()
 
     # ------------------------------------------------------------------
@@ -617,7 +704,12 @@ def train(cfg: dict):
                 aes=aes,
                 encoders=encoders,
                 uncond_ratio=uncond_ratio,
-                t_mu=t_mu,
+                mu_y1=mu_y1,
+                mu_y2=mu_y2,
+                mu_override=mu_override,
+                mu_sigma=mu_sigma,
+                minres=minres,
+                maxres=maxres,
             )
 
             # ---------- Backward ------------------------------------------
@@ -643,7 +735,6 @@ def train(cfg: dict):
             pbar.set_postfix(
                 loss=f"{total_loss:.4f}",
                 lr=f"{lr_now:.2e}",
-                t_mu=f"{t_mu:.3f}",
                 step=global_step,
             )
 
@@ -651,7 +742,6 @@ def train(cfg: dict):
                 global_step,
                 f"{total_loss:.6f}",
                 f"{lr_now:.2e}",
-                f"{t_mu:.4f}",
                 f"{time.time() - t0:.1f}",
             ])
             if global_step % log_every == 0:
@@ -677,7 +767,7 @@ def train(cfg: dict):
                         gpu_id,
                         wrapper.models[gpu_id],
                         aes[gpu_id],
-                        encoders[0],
+                        encoders[gpu_id],
                         _x0_clean_latent,
                         _captions_gpu,
                         steps=preview_steps,
