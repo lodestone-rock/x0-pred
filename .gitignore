@@ -8,3 +8,6 @@ init.sh
 /mnist
 *.jpg
 hf_cache
+/experiments
+/checkpoints
+__pycache__
